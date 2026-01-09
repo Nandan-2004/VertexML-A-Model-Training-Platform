@@ -17,3 +17,4 @@ skl2onnx>=1.15.0
 openai>=1.0.0
 scipy>=1.10.0
 python-dotenv>=1.0.0
+setuptools>=68.0.0
