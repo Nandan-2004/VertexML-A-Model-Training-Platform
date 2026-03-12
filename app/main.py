@@ -786,79 +786,26 @@ class EnhancedAutoMLModel:
         """Get the trained model"""
         return self.model
 
-# ==================== FIXED: Enhanced GPT Dataset Analyzer ====================
-class EnhancedGPTDatasetAnalyzer:
-    def __init__(self, api_key: str = None):
-        """Initialize GPT dataset analyzer with calibration"""
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+# ==================== LOCAL DATASET ANALYZER (No External API Required) ====================
+class LocalDatasetAnalyzer:
+    """
+    Fully independent, data-driven dataset analyzer.
+    Analyzes dataset properties using statistical methods — no external API required.
+    """
+    def __init__(self):
         self.calibrator = PerformanceCalibrator()
-        if not self.api_key:
-            st.warning("OpenAI API key not found. Please set OPENAI_API_KEY environment variable or provide it in the app.")
-            self.client = None
-            return
-        
-        try:
-            from openai import OpenAI
-            self.client = OpenAI(api_key=self.api_key)
-            self.api_version = "new"
-        except ImportError:
-            try:
-                import openai
-                openai.api_key = self.api_key
-                self.client = openai
-                self.api_version = "old"
-            except Exception as e:
-                st.error(f"Failed to initialize OpenAI client: {e}")
-                self.client = None
     
     def analyze_dataset(self, df: pd.DataFrame, target_col: str = None) -> Dict[str, Any]:
-        """Analyze dataset using GPT and return calibrated insights"""
-        if not self.client:
-            return {"error": "OpenAI client not initialized"}
-        
+        """Analyze dataset using statistical methods and return structured insights."""
         try:
-            # Create dataset summary
-            dataset_summary = self._create_dataset_summary(df, target_col)
-            
-            # Create prompt for GPT with calibration guidance
-            prompt = self._create_calibrated_analysis_prompt(df, dataset_summary, target_col)
-            
-            # Call GPT API
-            if self.api_version == "new":
-                response = self.client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role": "system", "content": "You are a data science expert providing realistic, calibrated analysis of datasets. Provide conservative estimates based on typical real-world performance."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.5,
-                    max_tokens=2000
-                )
-                gpt_analysis = response.choices[0].message.content
-            else:
-                response = self.client.ChatCompletion.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role": "system", "content": "You are a data science expert providing realistic, calibrated analysis of datasets. Provide conservative estimates based on typical real-world performance."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.5,
-                    max_tokens=2000
-                )
-                gpt_analysis = response.choices[0].message.content
-            
-            # Parse GPT response and calibrate estimates
-            analysis_result = self._parse_and_calibrate_gpt_response(gpt_analysis, dataset_summary)
-            analysis_result["gpt_raw_response"] = gpt_analysis
-            
-            return analysis_result
-            
+            summary = self._create_dataset_summary(df, target_col)
+            return self._generate_analysis(df, summary, target_col)
         except Exception as e:
-            return {"error": f"GPT analysis failed: {str(e)}"}
+            return {"error": f"Analysis failed: {str(e)}"}
     
     def _create_dataset_summary(self, df: pd.DataFrame, target_col: str = None) -> Dict[str, Any]:
-        """Create comprehensive dataset summary"""
-        dataset_summary = {
+        """Create comprehensive dataset summary."""
+        summary: Dict[str, Any] = {
             "shape": df.shape,
             "columns": list(df.columns),
             "dtypes": {col: str(df[col].dtype) for col in df.columns},
@@ -868,251 +815,318 @@ class EnhancedGPTDatasetAnalyzer:
             "basic_stats": {},
             "correlation_info": {}
         }
-        
-        # Add basic statistics for numerical columns
-        if dataset_summary["numerical_columns"]:
-            dataset_summary["basic_stats"] = df[dataset_summary["numerical_columns"]].describe().to_dict()
-            
-            # Calculate correlations if there are at least 2 numerical columns
-            if len(dataset_summary["numerical_columns"]) >= 2:
+
+        if summary["numerical_columns"]:
+            summary["basic_stats"] = df[summary["numerical_columns"]].describe().to_dict()
+            if len(summary["numerical_columns"]) >= 2:
                 try:
-                    corr_matrix = df[dataset_summary["numerical_columns"]].corr()
-                    # Get top 5 correlations
+                    corr_matrix = df[summary["numerical_columns"]].corr()
                     corr_pairs = []
                     for i in range(len(corr_matrix.columns)):
-                        for j in range(i+1, len(corr_matrix.columns)):
+                        for j in range(i + 1, len(corr_matrix.columns)):
                             corr_pairs.append({
                                 "features": [corr_matrix.columns[i], corr_matrix.columns[j]],
                                 "correlation": float(corr_matrix.iloc[i, j])
                             })
-                    
-                    # Sort by absolute correlation
                     corr_pairs.sort(key=lambda x: abs(x["correlation"]), reverse=True)
-                    dataset_summary["correlation_info"]["top_correlations"] = corr_pairs[:5]
-                except:
+                    summary["correlation_info"]["top_correlations"] = corr_pairs[:5]
+                except Exception:
                     pass
-        
-        # Add target column analysis if provided
+
         if target_col and target_col in df.columns:
-            dataset_summary["target_analysis"] = {
+            summary["target_analysis"] = {
                 "name": target_col,
                 "dtype": str(df[target_col].dtype),
                 "unique_values": int(df[target_col].nunique()),
                 "missing_count": int(df[target_col].isnull().sum()),
                 "value_counts": df[target_col].value_counts().to_dict()
             }
-            
-            # Detect task type
             if pd.api.types.is_numeric_dtype(df[target_col]):
-                if df[target_col].nunique() > 10:
-                    dataset_summary["task_type"] = "regression"
-                else:
-                    dataset_summary["task_type"] = "classification"
+                summary["task_type"] = "regression" if df[target_col].nunique() > 10 else "classification"
             else:
-                dataset_summary["task_type"] = "classification"
-        
-        return dataset_summary
-    
-    def _create_calibrated_analysis_prompt(self, df: pd.DataFrame, summary: Dict, target_col: str = None) -> str:
-        """Create prompt for GPT with emphasis on realistic estimates"""
-        prompt = f"""
-        Analyze this dataset and provide REALISTIC, CONSERVATIVE insights including estimated accuracy for different algorithms.
-        IMPORTANT: Provide estimates that reflect TYPICAL real-world performance, not optimistic best-case scenarios.
-        
-        DATASET SUMMARY:
-        - Shape: {summary['shape']} (rows x columns)
-        - Total Features: {len(summary['columns'])}
-        - Numerical Features: {len(summary['numerical_columns'])}
-        - Categorical Features: {len(summary['categorical_columns'])}
-        - Missing Values Total: {sum(summary['missing_values'].values())}
-        """
-        
-        # Add data quality warnings
-        issues = []
-        if df.shape[0] < 100:
-            issues.append("Very small dataset")
-        if df.shape[1] > df.shape[0]:
-            issues.append("High dimensionality (more features than samples)")
-        if sum(summary['missing_values'].values()) / (df.shape[0] * df.shape[1]) > 0.1:
-            issues.append("High missing value ratio (>10%)")
-        
-        if issues:
-            prompt += "\nDATA QUALITY CONCERNS:\n"
-            for issue in issues:
-                prompt += f"- {issue}\n"
-        
-        if 'correlation_info' in summary and 'top_correlations' in summary['correlation_info']:
-            prompt += "\nTOP CORRELATIONS:\n"
-            for corr in summary['correlation_info']['top_correlations'][:3]:
-                prompt += f"- {corr['features'][0]} & {corr['features'][1]}: {corr['correlation']:.3f}\n"
-        
-        if target_col and 'target_analysis' in summary:
-            target_info = summary['target_analysis']
-            prompt += f"""
-            
-            TARGET COLUMN ANALYSIS:
-            - Name: {target_info['name']}
-            - Data Type: {target_info['dtype']}
-            - Unique Values: {target_info['unique_values']}
-            - Missing Values: {target_info['missing_count']}
-            - Task Type: {summary.get('task_type', 'Unknown')}
-            """
-            
-            # Add realism factors
-            if summary.get('task_type') == 'classification':
-                total = sum(target_info['value_counts'].values())
-                if total > 0:
-                    max_class = max(target_info['value_counts'].values())
-                    min_class = min(target_info['value_counts'].values())
-                    imbalance_ratio = max_class / min_class if min_class > 0 else float('inf')
-                    prompt += f"\n- Class Imbalance Ratio: {imbalance_ratio:.2f}"
-                    if imbalance_ratio > 3:
-                        prompt += " (Significant imbalance - REDUCE accuracy estimates by 10-15%)"
-        
-        prompt += """
-        
-        Please provide REALISTIC analysis in the following JSON structure:
-        {
-            "dataset_quality": {
-                "score": 0-100,
-                "issues": ["list of issues"],
-                "strengths": ["list of strengths"]
-            },
-            "algorithm_recommendations": {
-                "classification": [
-                    {"algorithm": "Auto-Ensemble", "estimated_accuracy": "80-85%", "reason": "Combines RF, XGBoost, and Logistic Regression for maximum robustness"},
-                    {"algorithm": "XGBoost", "estimated_accuracy": "75-80%", "reason": "Excellent for tabular data with complex patterns"},
-                    {"algorithm": "Random Forest", "estimated_accuracy": "70-75%", "reason": "Explanation why this algorithm is suitable with realistic expectations"},
-                    {"algorithm": "Logistic Regression", "estimated_accuracy": "65-70%", "reason": "Explanation"}
-                ],
-                "regression": [
-                    {"algorithm": "Auto-Ensemble", "estimated_r2": "0.75-0.85", "reason": "Ensemble of RF, XGBoost, and Ridge for superior predictive power"},
-                    {"algorithm": "XGBoost", "estimated_r2": "0.70-0.80", "reason": "High performance on non-linear regression tasks"},
-                    {"algorithm": "Random Forest", "estimated_r2": "0.60-0.70", "reason": "Explanation"},
-                    {"algorithm": "Linear Regression", "estimated_r2": "0.55-0.65", "reason": "Explanation"}
-                ],
-                "clustering": [
-                    {"algorithm": "Algorithm Name", "estimated_silhouette": "0.3-0.5", "reason": "Explanation"},
-                    {"algorithm": "Another Algorithm", "estimated_silhouette": "0.25-0.45", "reason": "Explanation"}
-                ],
-                "dimensionality_reduction": [
-                    {"algorithm": "Algorithm Name", "estimated_variance": "65-80%", "reason": "Explanation"},
-                    {"algorithm": "Another Algorithm", "estimated_variance": "60-75%", "reason": "Explanation"}
-                ],
-                "anomaly_detection": [
-                    {"algorithm": "Algorithm Name", "estimated_precision": "75-85%", "reason": "Explanation"},
-                    {"algorithm": "Another Algorithm", "estimated_precision": "70-80%", "reason": "Explanation"}
-                ]
-            },
-            "data_preprocessing_recommendations": ["list of preprocessing steps"],
-            "insights": ["list of key insights"],
-            "warnings": ["list of warnings"],
-            "next_steps": ["list of recommended next steps"],
-            "estimated_training_time": "Estimate of training time (be realistic)",
-            "realism_factors": ["list of factors that might reduce performance"]
+                summary["task_type"] = "classification"
+
+        return summary
+
+    def _compute_quality_score(self, df: pd.DataFrame, summary: Dict) -> Tuple[int, List[str], List[str]]:
+        """Compute a quality score 0–100 from dataset properties."""
+        score = 100
+        issues: List[str] = []
+        strengths: List[str] = []
+        n, m = df.shape
+
+        if n < 100:
+            score -= 25
+            issues.append("Very small dataset (<100 rows) — high risk of overfitting.")
+        elif n < 500:
+            score -= 10
+            issues.append("Small dataset (<500 rows) — prefer simple, regularized models.")
+        elif n >= 5000:
+            strengths.append(f"Sufficient data ({n:,} rows) for training complex models.")
+
+        total_cells = max(n * m, 1)
+        missing = sum(summary["missing_values"].values())
+        missing_pct = missing / total_cells
+        if missing_pct > 0.3:
+            score -= 20
+            issues.append(f"High missing value ratio ({missing_pct:.1%}) — aggressive imputation needed.")
+        elif missing_pct > 0.1:
+            score -= 10
+            issues.append(f"Moderate missing values ({missing_pct:.1%}) — imputation recommended.")
+        elif missing_pct == 0.0:
+            strengths.append("No missing values — complete dataset.")
+
+        if m > n:
+            score -= 15
+            issues.append("More features than samples — high overfitting risk; consider dimensionality reduction.")
+        elif m > 100:
+            score -= 5
+            issues.append(f"High feature count ({m}) — feature selection may improve performance.")
+        elif 5 <= m <= 50:
+            strengths.append(f"Well-proportioned feature count ({m} features).")
+
+        dup_count = int(df.duplicated().sum())
+        if dup_count > 0:
+            dup_pct = dup_count / n
+            score -= min(10, int(dup_pct * 50))
+            issues.append(f"{dup_count} duplicate rows detected ({dup_pct:.1%}) — de-duplication recommended.")
+
+        if "target_analysis" in summary and summary.get("task_type") == "classification":
+            vc = list(summary["target_analysis"].get("value_counts", {}).values())
+            if len(vc) >= 2 and min(vc) > 0:
+                imbalance = max(vc) / min(vc)
+                if imbalance > 5:
+                    score -= 10
+                    issues.append(f"Class imbalance ratio ~{imbalance:.1f}x — enable class weighting.")
+
+        score = max(0, min(100, score))
+        if not strengths:
+            if score >= 60:
+                strengths.append("Dataset structure is generally suitable for machine learning.")
+        return score, issues, strengths
+
+    def _generate_algorithm_recommendations(self, df: pd.DataFrame, summary: Dict,
+                                             task_type: str) -> Dict[str, List]:
+        """Generate data-driven algorithm recommendations with estimated performance ranges."""
+        n, m = df.shape
+        total_cells = max(n * m, 1)
+        missing_pct = sum(summary["missing_values"].values()) / total_cells
+
+        size_factor = 0.75 if n < 100 else (0.88 if n < 500 else 1.0)
+        quality_factor = max(0.80, 1.0 - missing_pct * 0.5)
+        factor = size_factor * quality_factor
+
+        def acc_range(base: float, spread: float = 0.05) -> str:
+            lo = max(40, int((base - spread) * 100))
+            hi = min(97, int((base + spread) * 100))
+            return f"{lo}-{hi}%"
+
+        def r2_range(base: float, spread: float = 0.06) -> str:
+            return f"{max(0.05, base - spread):.2f}-{min(0.97, base + spread):.2f}"
+
+        base_acc = min(0.90, 0.80 * factor)
+        base_r2 = min(0.88, 0.72 * factor)
+
+        recs: Dict[str, List] = {
+            "classification": [
+                {"algorithm": "Auto-Ensemble",
+                 "estimated_accuracy": acc_range(base_acc),
+                 "reason": "Combines Random Forest, XGBoost, and Logistic Regression for maximum robustness."},
+                {"algorithm": "XGBoost",
+                 "estimated_accuracy": acc_range(base_acc - 0.04),
+                 "reason": "Gradient boosting excels at capturing complex non-linear patterns in tabular data."},
+                {"algorithm": "Random Forest",
+                 "estimated_accuracy": acc_range(base_acc - 0.07),
+                 "reason": "Robust ensemble with good generalization and built-in feature importance."},
+                {"algorithm": "Logistic Regression",
+                 "estimated_accuracy": acc_range(base_acc - 0.13),
+                 "reason": "Fast and interpretable — strong baseline when class separation is approximately linear."},
+            ],
+            "regression": [
+                {"algorithm": "Auto-Ensemble",
+                 "estimated_r2": r2_range(base_r2),
+                 "reason": "Ensemble of RF, XGBoost, and Ridge combines the strength of multiple learners."},
+                {"algorithm": "XGBoost",
+                 "estimated_r2": r2_range(base_r2 - 0.06),
+                 "reason": "High performance on non-linear regression tasks with structured data."},
+                {"algorithm": "Random Forest",
+                 "estimated_r2": r2_range(base_r2 - 0.10),
+                 "reason": "Robust to outliers; captures complex feature interactions without manual scaling."},
+                {"algorithm": "Linear Regression",
+                 "estimated_r2": r2_range(base_r2 - 0.20),
+                 "reason": "Excellent interpretable baseline for datasets with linear feature-target relationships."},
+            ],
+            "clustering": [
+                {"algorithm": "K-Means",         "estimated_silhouette": "0.30-0.55",
+                 "reason": "Fast and scalable — best for compact, spherical clusters."},
+                {"algorithm": "DBSCAN",           "estimated_silhouette": "0.20-0.45",
+                 "reason": "Handles arbitrary cluster shapes and identifies noise/outliers."},
+                {"algorithm": "Hierarchical",     "estimated_silhouette": "0.25-0.50",
+                 "reason": "No need to pre-specify cluster count; produces an informative dendrogram."},
+                {"algorithm": "Gaussian Mixture", "estimated_silhouette": "0.25-0.48",
+                 "reason": "Soft probabilistic assignments with flexible covariance shapes."},
+            ],
+            "dimensionality_reduction": [
+                {"algorithm": "PCA",   "estimated_variance": "65-85%",
+                 "reason": "Linear reduction preserving maximum variance; fastest and most interpretable."},
+                {"algorithm": "UMAP",  "estimated_variance": "70-88%",
+                 "reason": "Non-linear; preserves both global and local structure — ideal for visualization."},
+                {"algorithm": "t-SNE", "estimated_variance": "60-80%",
+                 "reason": "High-quality 2D/3D visualization by preserving local neighborhood structure."},
+                {"algorithm": "ICA",   "estimated_variance": "60-78%",
+                 "reason": "Finds statistically independent source components; useful for signal separation."},
+            ],
+            "anomaly_detection": [
+                {"algorithm": "Isolation Forest",     "estimated_precision": "75-85%",
+                 "reason": "Efficient for high-dimensional data; isolates anomalies using random splits."},
+                {"algorithm": "Local Outlier Factor",  "estimated_precision": "70-80%",
+                 "reason": "Density-based detection; identifies anomalies relative to local neighborhood."},
+                {"algorithm": "One-Class SVM",         "estimated_precision": "65-78%",
+                 "reason": "Learns a compact boundary around normal data; effective in high dimensions."},
+                {"algorithm": "Elliptic Envelope",     "estimated_precision": "65-75%",
+                 "reason": "Assumes Gaussian distribution; efficient for unimodal, low-dimensional data."},
+            ],
         }
-        
-        IMPORTANT GUIDELINES FOR ESTIMATES:
-        1. For classification: Start with 60-70% for baseline, 70-80% for good models, 80-90% only for exceptional cases
-        2. For regression: R² of 0.5-0.7 is typical, 0.7-0.8 is good, >0.8 is excellent
-        3. Account for dataset size: Small datasets (<1000 samples) reduce estimates by 10-20%
-        4. Account for data quality issues: Missing values, noise reduce estimates
-        5. Be CONSERVATIVE - real-world performance is usually lower than theoretical
-        
-        Also provide a brief summary in markdown format at the end.
-        """
-        
-        return prompt
-    
-    def _parse_and_calibrate_gpt_response(self, response: str, dataset_summary: Dict) -> Dict[str, Any]:
-        """Parse GPT response and calibrate estimates"""
-        try:
-            import re
-            
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(0)
-                parsed_data = json.loads(json_str)
+
+        for algo in recs["classification"]:
+            algo["calibrated_numeric"] = self.calibrator.calibrate_estimate(
+                algo["estimated_accuracy"], "classification")
+        for algo in recs["regression"]:
+            algo["calibrated_numeric"] = self.calibrator.calibrate_estimate(
+                algo["estimated_r2"], "regression")
+
+        return recs
+
+    def _generate_preprocessing_recommendations(self, summary: Dict) -> List[str]:
+        recs = ["StandardScaler applied to normalize all numerical features."]
+        if sum(summary["missing_values"].values()) > 0:
+            recs.append("Median imputation for numerical columns; most-frequent for categorical columns.")
+        if summary.get("categorical_columns"):
+            recs.append(f"OneHotEncoding applied to {len(summary['categorical_columns'])} categorical feature(s).")
+        if len(summary.get("numerical_columns", [])) > 10:
+            recs.append("VarianceThreshold applied to remove near-zero variance features.")
+        recs.append("Recommended train/test split: 80/20 with stratification for classification tasks.")
+        return recs
+
+    def _generate_insights(self, df: pd.DataFrame, summary: Dict, task_type: str) -> List[str]:
+        insights: List[str] = []
+        n, m = df.shape
+        insights.append(f"Dataset contains {n:,} samples and {m} features.")
+        num_c = len(summary.get("numerical_columns", []))
+        cat_c = len(summary.get("categorical_columns", []))
+        insights.append(f"{num_c} numerical and {cat_c} categorical features detected.")
+
+        if "correlation_info" in summary and "top_correlations" in summary["correlation_info"]:
+            top_corr = summary["correlation_info"]["top_correlations"]
+            if top_corr:
+                best = top_corr[0]
+                insights.append(
+                    f"Strongest correlation: {best['features'][0]} ↔ {best['features'][1]} "
+                    f"(r = {best['correlation']:.2f})."
+                )
+
+        if "target_analysis" in summary:
+            ta = summary["target_analysis"]
+            if task_type == "classification":
+                insights.append(f"Target '{ta['name']}' has {ta['unique_values']} unique classes.")
             else:
-                parsed_data = self._create_fallback_response(response)
-            
-            # Calibrate the estimates
-            for task_type in ['classification', 'regression', 'clustering', 
-                            'dimensionality_reduction', 'anomaly_detection']:
-                if task_type in parsed_data.get('algorithm_recommendations', {}):
-                    for algo in parsed_data['algorithm_recommendations'][task_type]:
-                        # Extract and calibrate
-                        if task_type == 'classification':
-                            est_str = algo.get('estimated_accuracy', '60%')
-                            calibrated = self.calibrator.calibrate_estimate(est_str, task_type)
-                            # Format back to percentage string
-                            low = int((calibrated - 0.05) * 100)
-                            high = int((calibrated + 0.05) * 100)
-                            algo['estimated_accuracy'] = f"{max(50, low)}-{min(95, high)}%"
-                            algo['calibrated_numeric'] = calibrated
-                        
-                        elif task_type == 'regression':
-                            est_str = algo.get('estimated_r2', '0.5')
-                            calibrated = self.calibrator.calibrate_estimate(est_str, task_type)
-                            low = calibrated - 0.1
-                            high = calibrated + 0.1
-                            algo['estimated_r2'] = f"{max(0.1, low):.2f}-{min(0.95, high):.2f}"
-                            algo['calibrated_numeric'] = calibrated
-            
-            # Add calibration info
-            parsed_data['calibration_info'] = {
-                'calibration_factors': self.calibrator.calibration_factors,
-                'calibration_samples': len(self.calibrator.history)
-            }
-            
-            # Extract markdown summary
-            summary_match = re.search(r'## Summary.*?(?=\n##|\Z)', response, re.DOTALL | re.IGNORECASE)
-            if summary_match:
-                parsed_data["summary_markdown"] = summary_match.group(0)
-            else:
-                parsed_data["summary_markdown"] = "## Summary\n" + response.split("}")[-1].strip()
-            
-            return parsed_data
-            
-        except Exception as e:
-            st.warning(f"Error parsing GPT response: {str(e)}")
-            return self._create_fallback_response(response)
-    
-    def _create_fallback_response(self, response: str) -> Dict[str, Any]:
-        """Create conservative fallback response"""
+                insights.append(f"Target '{ta['name']}' is continuous — regression task detected.")
+
+        if n > 10000:
+            insights.append("Large dataset: ensemble and gradient boosting methods recommended.")
+        elif n < 200:
+            insights.append("Small dataset: regularized models and cross-validation are essential.")
+        if m > n:
+            insights.append("High dimensionality: apply PCA or feature selection to mitigate overfitting.")
+        return insights
+
+    def _generate_warnings(self, df: pd.DataFrame, summary: Dict) -> List[str]:
+        warnings_list: List[str] = []
+        n, m = df.shape
+        total_cells = max(n * m, 1)
+        missing_pct = sum(summary["missing_values"].values()) / total_cells
+        if missing_pct > 0.1:
+            warnings_list.append(f"High missing value ratio ({missing_pct:.1%}) may degrade model performance.")
+        if n < 100:
+            warnings_list.append("Very small dataset — results may be statistically unstable.")
+        if m > n:
+            warnings_list.append("More features than samples — regularization is strongly recommended.")
+        dup_count = int(df.duplicated().sum())
+        if dup_count > 0:
+            warnings_list.append(f"{dup_count} duplicate rows may bias model training.")
+        if not warnings_list:
+            warnings_list.append("No critical data quality issues detected.")
+        return warnings_list
+
+    def _generate_next_steps(self, summary: Dict, task_type: str) -> List[str]:
+        steps = [
+            "Run 'Analyze Dataset Patterns' for statistical insights before selecting a model.",
+            "Use 'Run Pilot Benchmark' to quickly compare representative model performance.",
+        ]
+        if task_type == "classification":
+            steps.append("For imbalanced classes, enable 'Handle class imbalance' in the training options.")
+        elif task_type == "regression":
+            steps.append("Review the Actual vs Predicted scatter plot to assess model fit quality.")
+        elif task_type == "clustering":
+            steps.append("Experiment with different cluster counts and evaluate the Silhouette score.")
+        steps.append("Download the trained model after evaluation for deployment or further analysis.")
+        return steps
+
+    def _estimate_training_time(self, n_samples: int, n_features: int) -> str:
+        complexity = n_samples * n_features
+        if complexity < 10_000:
+            return "< 30 seconds"
+        elif complexity < 100_000:
+            return "30 seconds – 2 minutes"
+        elif complexity < 1_000_000:
+            return "2 – 10 minutes"
+        else:
+            return "10+ minutes (consider subsampling for exploratory runs)"
+
+    def _generate_summary_markdown(self, df: pd.DataFrame, summary: Dict,
+                                    quality_score: int, insights: List[str],
+                                    task_type: str) -> str:
+        n, m = df.shape
+        task_display = task_type.replace("_", " ").title() if task_type else "Unknown"
+        md = (
+            f"## Analysis Summary\n\n"
+            f"**Dataset:** {n:,} rows × {m} columns  \n"
+            f"**Detected Task:** {task_display}  \n"
+            f"**Quality Score:** {quality_score}/100\n\n"
+            f"### Key Observations\n"
+        )
+        for obs in insights[:6]:
+            md += f"- {obs}\n"
+        return md
+
+    def _generate_analysis(self, df: pd.DataFrame, summary: Dict,
+                            target_col: str = None) -> Dict[str, Any]:
+        """Orchestrate the full data-driven analysis."""
+        task_type = summary.get("task_type", "unknown")
+        n, m = df.shape
+        quality_score, quality_issues, quality_strengths = self._compute_quality_score(df, summary)
+        algo_recs     = self._generate_algorithm_recommendations(df, summary, task_type)
+        pre_recs      = self._generate_preprocessing_recommendations(summary)
+        insights      = self._generate_insights(df, summary, task_type)
+        warnings_list = self._generate_warnings(df, summary)
+        next_steps    = self._generate_next_steps(summary, task_type)
+        est_time      = self._estimate_training_time(n, m)
+        summary_md    = self._generate_summary_markdown(df, summary, quality_score, insights, task_type)
+
         return {
-            "dataset_quality": {"score": 50, "issues": [], "strengths": []},
-            "algorithm_recommendations": {
-                "classification": [
-                    {"algorithm": "Random Forest", "estimated_accuracy": "65-75%", "reason": "Good for most classification tasks"},
-                    {"algorithm": "XGBoost", "estimated_accuracy": "70-80%", "reason": "Excellent for complex patterns"},
-                    {"algorithm": "Logistic Regression", "estimated_accuracy": "60-70%", "reason": "Good baseline model"}
-                ],
-                "regression": [
-                    {"algorithm": "Random Forest", "estimated_r2": "0.60-0.75", "reason": "Robust for regression problems"},
-                    {"algorithm": "XGBoost", "estimated_r2": "0.65-0.80", "reason": "High accuracy with complex data"},
-                    {"algorithm": "Linear Regression", "estimated_r2": "0.50-0.65", "reason": "Simple baseline model"}
-                ],
-                "clustering": [
-                    {"algorithm": "K-Means", "estimated_silhouette": "0.3-0.5", "reason": "Good for spherical clusters"},
-                    {"algorithm": "DBSCAN", "estimated_silhouette": "0.2-0.4", "reason": "Finds arbitrary shaped clusters"}
-                ],
-                "dimensionality_reduction": [
-                    {"algorithm": "PCA", "estimated_variance": "60-75%", "reason": "Standard linear reduction"},
-                    {"algorithm": "UMAP", "estimated_variance": "65-80%", "reason": "Good for visualization"}
-                ],
-                "anomaly_detection": [
-                    {"algorithm": "Isolation Forest", "estimated_precision": "75-85%", "reason": "Effective for high dimensions"},
-                    {"algorithm": "Local Outlier Factor", "estimated_precision": "70-80%", "reason": "Good for varying densities"}
-                ]
+            "dataset_quality": {
+                "score": quality_score,
+                "issues": quality_issues,
+                "strengths": quality_strengths
             },
-            "data_preprocessing_recommendations": ["Handle missing values", "Scale numerical features", "Encode categorical variables"],
-            "insights": ["Analysis provided in summary"],
-            "warnings": ["Conservative estimates used - actual performance may vary"],
-            "next_steps": ["Proceed with model training"],
-            "estimated_training_time": "2-5 minutes",
-            "realism_factors": ["Using conservative estimates"],
-            "summary_markdown": f"## Analysis Summary\n{response}"
+            "algorithm_recommendations": algo_recs,
+            "data_preprocessing_recommendations": pre_recs,
+            "insights": insights,
+            "warnings": warnings_list,
+            "next_steps": next_steps,
+            "estimated_training_time": est_time,
+            "realism_factors": warnings_list,
+            "summary_markdown": summary_md
         }
 
 # ==================== HELPER FUNCTIONS FOR DIFFERENT TASK TYPES ====================
@@ -1935,12 +1949,7 @@ def main():
     # Sidebar configuration
     st.sidebar.title("VertexML")
     st.sidebar.markdown("---")
-    
-    openai_api_key = os.environ.get("OPENAI_API_KEY")
-    if openai_api_key:
-        st.sidebar.success("AI Engine Connected")
-    else:
-        st.sidebar.warning("AI Engine Offline (Set OPENAI_API_KEY)")
+    st.sidebar.success("AI Engine Active (Local)")
     
     # Enhanced configuration
     st.sidebar.subheader("Enhanced Settings")
@@ -1948,8 +1957,8 @@ def main():
     enable_cross_validation = st.sidebar.checkbox("Enable Cross-Validation", value=True)
     enable_feature_selection = st.sidebar.checkbox("Enable Feature Selection", value=True)
     
-    # Initialize GPT Analyzer
-    gpt_analyzer = EnhancedGPTDatasetAnalyzer(openai_api_key)
+    # Initialize local analyzer (no external API required)
+    analyzer = LocalDatasetAnalyzer()
     
     # Session state management
     def reset_all_runs():
@@ -2001,34 +2010,32 @@ def main():
                              "Anomaly Detection"],
                             horizontal=True, key="task_type_radio", on_change=reset_all_runs)
 
-        # GPT Analysis
-        if openai_api_key:
-            if st.button("Generate Intelligent Report", key="analyze_gpt"):
-                with st.spinner("Analyzing dataset patterns and structures..."):
-                    analysis_result = gpt_analyzer.analyze_dataset(df)
-                    
-                    if "error" not in analysis_result:
-                        st.success("Report generated successfully!")
-                        st.session_state.gpt_analysis = analysis_result
-                    else:
-                        st.error(f"GPT Analysis Error: {analysis_result['error']}")
-            
-            # Persistently display report if it exists
-            if st.session_state.gpt_analysis:
-                with st.expander("Intelligent Dataset Report", expanded=True):
-                    # Determine current task type for calibrated suggestions
-                    display_task = None
-                    if task_type == "Supervised Learning":
-                        # We'll refine this once detected_task_type is known or chosen
-                        display_task = st.session_state.get('manual_task_mode', 'classification').lower()
-                    elif task_type == "Clustering":
-                        display_task = 'clustering'
-                    elif task_type == "Dimensionality Reduction":
-                        display_task = 'dimensionality_reduction'
-                    elif task_type == "Anomaly Detection":
-                        display_task = 'anomaly_detection'
-                    
-                    display_gpt_analysis_results(st.session_state.gpt_analysis, display_task)
+        # Data-Driven Analysis Report (fully local, no API key needed)
+        if st.button("Generate Intelligent Report", key="analyze_gpt"):
+            with st.spinner("Analyzing dataset patterns and structures..."):
+                analysis_result = analyzer.analyze_dataset(df)
+                
+                if "error" not in analysis_result:
+                    st.success("Report generated successfully!")
+                    st.session_state.gpt_analysis = analysis_result
+                else:
+                    st.error(f"Analysis Error: {analysis_result['error']}")
+        
+        # Persistently display report if it exists
+        if st.session_state.gpt_analysis:
+            with st.expander("Intelligent Dataset Report", expanded=True):
+                # Determine current task type for calibrated suggestions
+                display_task = None
+                if task_type == "Supervised Learning":
+                    display_task = st.session_state.get('manual_task_mode', 'classification').lower()
+                elif task_type == "Clustering":
+                    display_task = 'clustering'
+                elif task_type == "Dimensionality Reduction":
+                    display_task = 'dimensionality_reduction'
+                elif task_type == "Anomaly Detection":
+                    display_task = 'anomaly_detection'
+                
+                display_gpt_analysis_results(st.session_state.gpt_analysis, display_task)
         
         # ==================== SUPERVISED LEARNING ====================
         if task_type == "Supervised Learning":
@@ -2518,7 +2525,7 @@ def main():
             if st.session_state.gpt_analysis:
                 gpt_suggestions = st.session_state.gpt_analysis.get('algorithm_recommendations', {}).get('dimensionality_reduction', [])
                 if gpt_suggestions:
-                    with st.expander("GPT Recommendations (Calibrated)", expanded=True):
+                    with st.expander("AI Recommendations (Calibrated)", expanded=True):
                         for suggestion in gpt_suggestions[:3]:
                             st.write(f"**{suggestion['algorithm']}** - Estimated Variance: {suggestion.get('estimated_variance', 'N/A')}")
             
@@ -2672,11 +2679,11 @@ def main():
                     for insight in st.session_state.anomaly_insights:
                         st.write(f"• {insight}")
             
-            # GPT Suggestions
+            # AI Suggestions
             if st.session_state.gpt_analysis:
                 gpt_suggestions = st.session_state.gpt_analysis.get('algorithm_recommendations', {}).get('anomaly_detection', [])
                 if gpt_suggestions:
-                    with st.expander("GPT Recommendations (Calibrated)", expanded=True):
+                    with st.expander("AI Recommendations (Calibrated)", expanded=True):
                         for suggestion in gpt_suggestions[:3]:
                             st.write(f"**{suggestion['algorithm']}** - Estimated Precision: {suggestion.get('estimated_precision', 'N/A')}")
             

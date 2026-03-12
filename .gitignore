@@ -1,9 +1,7 @@
-venv/
 .venv/
-data/
-models/
-reports/
 __pycache__/
 *.pyc
+*.pyo
+.DS_Store
+*.egg-info/
 .env
-.streamlit/secrets.toml
