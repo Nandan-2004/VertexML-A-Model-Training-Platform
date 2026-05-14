@@ -16,3 +16,4 @@ onnx>=1.14.0
 skl2onnx>=1.15.0
 scipy>=1.10.0
 setuptools>=68.0.0
+optuna>=3.0.0

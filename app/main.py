@@ -1,41 +1,35 @@
 import os
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+import logging
+import hashlib
 import streamlit as st
 import pandas as pd
 import numpy as np
 import streamlit.components.v1 as components
 from pathlib import Path
-from sklearn.preprocessing import LabelEncoder, StandardScaler, OneHotEncoder
-from sklearn.impute import SimpleImputer
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from config import DEFAULT_RANDOM_STATE, MAX_TRIALS
+from preprocessing.preprocessor import EnhancedUniversalDataPreprocessor, get_processed_data, load_large_file
+
+logging.basicConfig(
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger('VertexML')
 from sklearn.ensemble import (
     RandomForestClassifier, RandomForestRegressor,
     GradientBoostingClassifier, GradientBoostingRegressor,
-    AdaBoostClassifier, AdaBoostRegressor,
-    BaggingClassifier, BaggingRegressor,
-    ExtraTreesClassifier, ExtraTreesRegressor,
     IsolationForest
 )
-from sklearn.linear_model import (
-    LogisticRegression, LinearRegression,
-    Ridge, Lasso, ElasticNet,
-    BayesianRidge, SGDClassifier, SGDRegressor,
-    PassiveAggressiveClassifier, PassiveAggressiveRegressor
-)
-from sklearn.svm import SVC, SVR, OneClassSVM
+from sklearn.linear_model import LogisticRegression, LinearRegression, Ridge
+from sklearn.svm import SVC
 from sklearn.preprocessing import label_binarize
-from sklearn.neighbors import (
-    KNeighborsClassifier, KNeighborsRegressor,
-    LocalOutlierFactor
-)
-from sklearn.naive_bayes import GaussianNB, MultinomialNB, BernoulliNB
-from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
-from sklearn.neural_network import MLPClassifier, MLPRegressor
-from sklearn.gaussian_process import GaussianProcessClassifier, GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF
-from sklearn.kernel_ridge import KernelRidge
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
+from sklearn.mixture import GaussianMixture
 from sklearn.metrics import (
     accuracy_score, precision_score,
     recall_score, f1_score, mean_squared_error,
@@ -44,19 +38,11 @@ from sklearn.metrics import (
     roc_curve, auc, roc_auc_score, confusion_matrix,
     mean_absolute_error
 )
-from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold, KFold, GridSearchCV, RandomizedSearchCV
-from sklearn.cluster import (
-    KMeans, DBSCAN, AgglomerativeClustering,
-    SpectralClustering, OPTICS, Birch,
-    MeanShift, AffinityPropagation, MiniBatchKMeans
-)
-from sklearn.mixture import GaussianMixture
+import optuna
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold, KFold
 from sklearn.decomposition import PCA, NMF, FastICA, TruncatedSVD
 from sklearn.manifold import TSNE
-from sklearn.feature_selection import SelectKBest, mutual_info_classif, mutual_info_regression, f_regression, VarianceThreshold, RFE
-from sklearn.cross_decomposition import CCA
-from sklearn.covariance import EllipticEnvelope
-from sklearn.ensemble import VotingClassifier, VotingRegressor
+from sklearn.feature_selection import SelectKBest, mutual_info_classif, mutual_info_regression, f_regression, RFE
 from sklearn.semi_supervised import (
     SelfTrainingClassifier, LabelPropagation, LabelSpreading
 )
@@ -67,10 +53,9 @@ from sklearn.metrics.pairwise import pairwise_distances
 from sklearn.exceptions import NotFittedError
 import matplotlib.pyplot as plt
 import seaborn as sns
-from time import sleep, time
+from time import sleep, time, perf_counter
 from xgboost import XGBClassifier, XGBRegressor
-from lightgbm import LGBMClassifier, LGBMRegressor
-from catboost import CatBoostClassifier, CatBoostRegressor
+from lightgbm import LGBMClassifier
 import plotly.express as px
 from yellowbrick.cluster import KElbowVisualizer, SilhouetteVisualizer
 from umap import UMAP
@@ -92,6 +77,62 @@ import datetime
 from scipy import stats
 from scipy.stats import randint, uniform
 
+MODEL_REGISTRY = {
+    "classification": {
+        "Logistic Regression": LogisticRegression,
+        "Random Forest": RandomForestClassifier,
+        "Gradient Boosting": GradientBoostingClassifier,
+        "XGBoost": XGBClassifier,
+        "LightGBM": LGBMClassifier,
+        "SVM": SVC,
+    },
+    "regression": {
+        "Linear Regression": LinearRegression,
+        "Random Forest": RandomForestRegressor,
+        "XGBoost": XGBRegressor,
+        "Gradient Boosting": GradientBoostingRegressor,
+        "Ridge Regression": Ridge,
+    },
+    "clustering": {
+        "K-Means": KMeans,
+        "DBSCAN": DBSCAN,
+        "Hierarchical": AgglomerativeClustering,
+        "Gaussian Mixture": GaussianMixture,
+    },
+    "anomaly_detection": {
+        "Isolation Forest": IsolationForest,
+        "Local Outlier Factor": LocalOutlierFactor,
+    },
+}
+
+MODEL_DEFAULT_PARAMS = {
+    "classification": {
+        "Logistic Regression": {"max_iter": 2000, "random_state": DEFAULT_RANDOM_STATE},
+        "Random Forest": {"random_state": DEFAULT_RANDOM_STATE},
+        "Gradient Boosting": {"random_state": DEFAULT_RANDOM_STATE},
+        "XGBoost": {"eval_metric": "logloss", "random_state": DEFAULT_RANDOM_STATE, "verbosity": 0},
+        "LightGBM": {"random_state": DEFAULT_RANDOM_STATE},
+        "SVM": {"probability": True, "random_state": DEFAULT_RANDOM_STATE},
+    },
+    "regression": {
+        "Linear Regression": {},
+        "Random Forest": {"random_state": DEFAULT_RANDOM_STATE},
+        "XGBoost": {"random_state": DEFAULT_RANDOM_STATE},
+        "Gradient Boosting": {"random_state": DEFAULT_RANDOM_STATE},
+        "Ridge Regression": {},
+    },
+    "clustering": {
+        "K-Means": {"random_state": 42, "n_init": 10},
+        "DBSCAN": {},
+        "Hierarchical": {},
+        "Gaussian Mixture": {"random_state": 42},
+    },
+    "anomaly_detection": {
+        "Isolation Forest": {"random_state": 42},
+        "Local Outlier Factor": {},
+    },
+}
+
 # Check for required packages
 try:
     import kaleido
@@ -110,96 +151,55 @@ pd.set_option('display.max_rows', None)
 pd.set_option('display.max_columns', None)
 
 # Premium UI Styling
-def apply_custom_styles():
-    st.markdown("""
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Outfit:wght@500;700&display=swap');
-        
+def load_css():
+    css_path = Path("assets/styles.css")
+    if css_path.exists():
+        with css_path.open("r", encoding="utf-8") as f:
+            st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
+    else:
+        st.warning("Unable to load CSS from assets/styles.css")
+
+
+def apply_custom_styles(theme_mode="light"):
+    if theme_mode == "dark":
+        theme_vars = """
         :root {
-            --glass-bg: rgba(30, 41, 59, 0.7);
-            --glass-border: rgba(255, 255, 255, 0.1);
-            --accent-primary: #38bdf8;
-            --accent-secondary: #818cf8;
-            --text-main: #f1f5f9;
+            --app-bg: #0b1220;
+            --app-bg-gradient: linear-gradient(180deg, #0f172a 0%, #111827 100%);
+            --surface: rgba(30, 41, 59, 0.72);
+            --surface-strong: rgba(30, 41, 59, 0.9);
+            --surface-border: rgba(148, 163, 184, 0.25);
+            --accent-primary: #0ea5e9;
+            --accent-secondary: #6366f1;
+            --text-main: #e2e8f0;
+            --text-muted: #94a3b8;
+            --card-shadow: 0 12px 26px rgba(2, 6, 23, 0.35);
         }
+        """
+    else:
+        theme_vars = """
+        :root {
+            --app-bg: #f8fafc;
+            --app-bg-gradient: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+            --surface: rgba(255, 255, 255, 0.9);
+            --surface-strong: rgba(255, 255, 255, 0.98);
+            --surface-border: rgba(15, 23, 42, 0.12);
+            --accent-primary: #0284c7;
+            --accent-secondary: #2563eb;
+            --text-main: #0f172a;
+            --text-muted: #475569;
+            --card-shadow: 0 8px 22px rgba(15, 23, 42, 0.08);
+        }
+        """
 
-        .stApp {
-            background: linear-gradient(180deg, #0f172a 0%, #111827 100%);
-            color: var(--text-main);
-            font-family: 'Inter', sans-serif;
-        }
-
-        [data-testid="stHeader"] {
-            background: transparent;
-        }
-
-        [data-testid="stSidebar"] {
-            background-color: rgba(15, 23, 42, 0.9) !important;
-            backdrop-filter: blur(12px);
-            border-right: 1px solid var(--glass-border);
-        }
-
-        .stButton>button {
-            background: linear-gradient(135deg, var(--accent-primary) 0%, var(--accent-secondary) 100%);
-            color: white;
-            border: none;
-            padding: 0.6rem 1.2rem;
-            border-radius: 10px;
-            font-weight: 600;
-            letter-spacing: 0.5px;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            box-shadow: 0 4px 12px rgba(56, 189, 248, 0.2);
-            width: 100%;
-        }
-
-        .stButton>button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 20px rgba(56, 189, 248, 0.4);
-            color: white;
-        }
-
-        .metric-card {
-            background: var(--glass-bg);
-            padding: 1.5rem;
-            border-radius: 16px;
-            border: 1px solid var(--glass-border);
-            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
-            transition: transform 0.2s ease;
-        }
-
-        .status-badge {
-            padding: 4px 12px;
-            border-radius: 9999px;
-            font-size: 0.8rem;
-            font-weight: 600;
-        }
-
-        h1, h2, h3 {
-            font-family: 'Outfit', sans-serif;
-            letter-spacing: -0.02em;
-        }
-        
-        div[data-testid="stExpander"] {
-            background: var(--glass-bg);
-            border: 1px solid var(--glass-border);
-            border-radius: 12px;
-        }
-
-        .stDataFrame {
-            border: 1px solid var(--glass-border);
-            border-radius: 12px;
-            overflow: hidden;
-        }
-    </style>
-    """, unsafe_allow_html=True)
-
-apply_custom_styles()
+    load_css()
+    st.markdown(f"<style>{theme_vars}</style>", unsafe_allow_html=True)
 
 # ==================== FIXED: CoTrainer Class ====================
 class CoTrainer(BaseEstimator, ClassifierMixin):
     def __init__(self, estimator1=None, estimator2=None, max_iter=100, random_state=None):
         self.estimator1 = estimator1 or LogisticRegression(max_iter=1000)
-        self.estimator2 = estimator2 or RandomForestClassifier(random_state=42)
+        self.estimator2 = estimator2 or RandomForestClassifier(random_state=DEFAULT_RANDOM_STATE)
         self.max_iter = max_iter
         self.random_state = random_state
         
@@ -376,180 +376,17 @@ class PerformanceCalibrator:
                 'timestamp': datetime.datetime.now()
             })
 
-# ==================== FIXED: Enhanced Data Preprocessor ====================
-@st.cache_data(show_spinner="Loading file...")
-def load_large_file(uploaded_file):
-    try:
-        ext = uploaded_file.name.split('.')[-1].lower()
-        if ext in ['csv', 'txt']:
-            return pd.read_csv(uploaded_file)
-        elif ext in ['xlsx', 'xls']:
-            return pd.read_excel(uploaded_file)
-        elif ext == 'parquet':
-            return pd.read_parquet(uploaded_file)
-        elif ext == 'feather':
-            return pd.read_feather(uploaded_file)
-    except Exception as e:
-        st.error(f"Failed to load file: {e}")
-    return None
-
-class EnhancedUniversalDataPreprocessor:
-    def __init__(self, use_dense=True, enable_feature_selection=True):
-        """
-        Enhanced UniversalDataPreprocessor with proper scaling and feature selection.
-        """
-        self.label_encoder = None
-        self.preprocessor = None
-        self.feature_selector = None
-        self.feature_names = None
-        self.use_dense = use_dense
-        self.enable_feature_selection = enable_feature_selection
-        self._fitted = False
-        self.scaler = StandardScaler()
-        self.variance_threshold = VarianceThreshold(threshold=0.01)
-
-    def detect_task_type(self, y=None):
-        if y is None:
-            return 'clustering'
-        if pd.api.types.is_numeric_dtype(y) and y.nunique() > 10:
-            return 'regression'
-        return 'classification'
-
-    def _validate_data(self, df):
-        """Clean and validate data"""
-        df_clean = df.copy()
-        
-        # Remove constant columns
-        constant_cols = [col for col in df_clean.columns if df_clean[col].nunique() <= 1]
-        if constant_cols:
-            st.info(f"Removing constant columns: {constant_cols}")
-            df_clean = df_clean.drop(columns=constant_cols)
-        
-        # Handle high cardinality categorical features
-        categorical_cols = df_clean.select_dtypes(include=['object', 'category']).columns
-        high_cardinality = [col for col in categorical_cols if df_clean[col].nunique() > 50]
-        if high_cardinality:
-            st.info(f"Removing high cardinality features: {high_cardinality}")
-            df_clean = df_clean.drop(columns=high_cardinality)
-        
-        return df_clean
-
-    def process(self, df, target_col=None):
-        # Clean the data first
-        df_clean = self._validate_data(df)
-        
-        if target_col is None:
-            X = df_clean.copy()
-            y = None
-            task_type = 'clustering'
-        else:
-            X = df_clean.drop(columns=[target_col])
-            y = df_clean[target_col]
-            
-            valid_indices = y.notna()
-            X = X[valid_indices]
-            y = y[valid_indices]
-
-            task_type = self.detect_task_type(y)
-
-            if task_type == 'classification':
-                self.label_encoder = LabelEncoder()
-                # Ensure labels are 0-indexed for models like XGBoost/LightGBM
-                y_transformed = self.label_encoder.fit_transform(y)
-                y = pd.Series(y_transformed, index=y.index, name=y.name)
-        
-        final_indices = X.index
-
-        numeric_features = X.select_dtypes(include=np.number).columns
-        categorical_features = X.select_dtypes(include=['object', 'category']).columns
-
-        # Proper StandardScaler pipeline
-        num_transform = Pipeline([
-            ('imputer', SimpleImputer(strategy='median')),
-            ('scaler', StandardScaler())
-        ])
-
-        # Use dense output for better compatibility
-        cat_transform = Pipeline([
-            ('imputer', SimpleImputer(strategy='most_frequent')),
-            ('encoder', OneHotEncoder(handle_unknown='ignore', sparse_output=not self.use_dense))
-        ])
-
-        self.preprocessor = ColumnTransformer([
-            ('num', num_transform, numeric_features),
-            ('cat', cat_transform, categorical_features)
-        ], remainder='drop')
-
-        # Fit and transform
-        X_processed = self.preprocessor.fit_transform(X)
-        
-        # Apply variance threshold for feature selection
-        original_shape = X_processed.shape[1]
-        if self.enable_feature_selection and original_shape > 10:
-            try:
-                self.variance_threshold.fit(X_processed)
-                X_processed = self.variance_threshold.transform(X_processed)
-                new_shape = X_processed.shape[1]
-                if new_shape < original_shape:
-                    st.info(f"Feature selection: Reduced from {original_shape} to {new_shape} features")
-            except Exception as e:
-                st.warning(f"Feature selection skipped: {str(e)}")
-        
-        # Get feature names
-        try:
-            cat_names = self.preprocessor.named_transformers_['cat']['encoder'].get_feature_names_out(categorical_features)
-        except (AttributeError, KeyError):
-            cat_names = []
-
-        # Get feature names after all transformations
-        self.feature_names = list(numeric_features) + list(cat_names)
-        
-        # Only filter feature names if VarianceThreshold was actually fitted and used
-        try:
-            check_is_fitted(self.variance_threshold)
-            if self.variance_threshold.get_support().size > 0:
-                if len(self.variance_threshold.get_support()) == len(self.feature_names):
-                    self.feature_names = np.array(self.feature_names)[self.variance_threshold.get_support()].tolist()
-        except NotFittedError:
-            # If not fitted, it means it was skipped or failed during fit
-            pass
-        
-        self._fitted = True
-
-        return X_processed, y, task_type, final_indices
-
-# ==================== CACHED PREPROCESSING ENGINE ====================
-@st.cache_data(show_spinner="Performing intelligent preprocessing...")
-def get_processed_data(df, target_col=None, enable_feature_selection=True):
-    """
-    Cached preprocessing function to ensure data is prepared automatically and efficiently.
-    """
-    preprocessor = EnhancedUniversalDataPreprocessor(
-        use_dense=True,
-        enable_feature_selection=enable_feature_selection
-    )
-    # df.copy() to ensure original data is not modified and for stable hashing
-    X, y, task_type, indices = preprocessor.process(df.copy(), target_col)
-    
-    return {
-        'X': X,
-        'y': y,
-        'task_type': task_type,
-        'indices': indices,
-        'preprocessor': preprocessor,
-        'feature_names': preprocessor.feature_names
-    }
-
 # ==================== FIXED: Enhanced AutoML Model ====================
 class EnhancedAutoMLModel:
     def __init__(self, task_type, model_choice, n_clusters=None, encoding_dim=None, 
-                 handle_imbalance=False, enable_tuning=True):
+                 handle_imbalance=False, enable_tuning=True, tuning_trials=MAX_TRIALS):
         self.task_type = task_type
         self.model_choice = model_choice
         self.n_clusters = n_clusters
         self.encoding_dim = encoding_dim
         self.handle_imbalance = handle_imbalance
         self.enable_tuning = enable_tuning
+        self.tuning_trials = max(1, int(tuning_trials))
         self.model = None
         self.best_params = None
         self.cv_scores = None
@@ -609,99 +446,58 @@ class EnhancedAutoMLModel:
     
     def _init_base_model(self):
         """Initialize base model without tuning"""
-        if self.task_type == 'classification':
-            class_weight_param = {'class_weight': 'balanced'} if self.handle_imbalance else {}
+        model_cls = MODEL_REGISTRY.get(self.task_type, {}).get(self.model_choice)
+        if model_cls is None:
+            return None
 
-            if self.model_choice == "Logistic Regression":
-                return LogisticRegression(max_iter=2000, random_state=42, **class_weight_param)
-            elif self.model_choice == "Decision Tree":
-                return DecisionTreeClassifier(random_state=42, **class_weight_param)
-            elif self.model_choice == "Random Forest":
-                return RandomForestClassifier(random_state=42, **class_weight_param)
-            elif self.model_choice == "Gradient Boosting":
-                return GradientBoostingClassifier(random_state=42)
-            elif self.model_choice == "XGBoost":
-                return XGBClassifier(eval_metric='logloss', random_state=42, use_label_encoder=False)
-            elif self.model_choice == "LightGBM":
-                return LGBMClassifier(random_state=42)
-            elif self.model_choice == "CatBoost":
-                return CatBoostClassifier(silent=True, random_state=42)
-            elif self.model_choice == "SVM":
-                return SVC(probability=True, random_state=42, **class_weight_param)
-            elif self.model_choice == "k-NN":
-                return KNeighborsClassifier()
-            elif self.model_choice == "Naive Bayes":
-                return GaussianNB()
-            elif self.model_choice == "MLP":
-                return MLPClassifier(max_iter=1000, random_state=42)
-            elif self.model_choice == "Auto-Ensemble":
-                clf1 = RandomForestClassifier(n_estimators=100, random_state=42, **class_weight_param)
-                clf2 = XGBClassifier(eval_metric='logloss', random_state=42)
-                clf3 = LogisticRegression(max_iter=2000, random_state=42, **class_weight_param)
-                return VotingClassifier(estimators=[('rf', clf1), ('xgb', clf2), ('lr', clf3)], voting='soft')
-            elif self.model_choice == "Co-Training":
-                return CoTrainer(random_state=42)
-        
-        elif self.task_type == 'regression':
-            if self.model_choice == "Linear Regression":
-                return LinearRegression()
-            elif self.model_choice == "Random Forest":
-                return RandomForestRegressor(random_state=42)
-            elif self.model_choice == "XGBoost":
-                return XGBRegressor(random_state=42)
-            elif self.model_choice == "Gradient Boosting":
-                return GradientBoostingRegressor(random_state=42)
-            elif self.model_choice == "LightGBM":
-                return LGBMRegressor(random_state=42)
-            elif self.model_choice == "Auto-Ensemble":
-                reg1 = RandomForestRegressor(n_estimators=100, random_state=42)
-                reg2 = XGBRegressor(random_state=42)
-                reg3 = Ridge(alpha=1.0)
-                return VotingRegressor(estimators=[('rf', reg1), ('xgb', reg2), ('ridge', reg3)])
-            elif self.model_choice == "SVR":
-                return SVR()
-            elif self.model_choice == "Ridge Regression":
-                return Ridge()
-        
-        elif self.task_type == 'clustering':
+        init_kwargs = MODEL_DEFAULT_PARAMS.get(self.task_type, {}).get(self.model_choice, {}).copy()
+
+        if self.task_type == 'classification' and self.handle_imbalance:
+            if self.model_choice in {"Logistic Regression", "Random Forest", "Gradient Boosting", "SVM"}:
+                init_kwargs['class_weight'] = 'balanced'
+
+        if self.task_type == 'clustering':
             if self.model_choice == "K-Means":
-                return KMeans(n_clusters=self.n_clusters, random_state=42, n_init=10)
-            elif self.model_choice == "DBSCAN":
-                return DBSCAN()
+                init_kwargs['n_clusters'] = self.n_clusters
             elif self.model_choice == "Hierarchical":
-                return AgglomerativeClustering(n_clusters=self.n_clusters)
-            elif self.model_choice == "Spectral":
-                return SpectralClustering(n_clusters=self.n_clusters, random_state=42)
+                init_kwargs['n_clusters'] = self.n_clusters
             elif self.model_choice == "Gaussian Mixture":
-                return GaussianMixture(n_components=self.n_clusters, random_state=42)
-        
-        elif self.task_type == 'dimensionality_reduction':
-            if self.model_choice == "PCA":
-                return PCA(n_components=self.encoding_dim, random_state=42)
-            elif self.model_choice == "t-SNE":
-                return TSNE(n_components=self.encoding_dim, random_state=42)
-            elif self.model_choice == "UMAP":
-                return UMAP(n_components=self.encoding_dim, random_state=42)
-            elif self.model_choice == "ICA":
-                return FastICA(n_components=self.encoding_dim, random_state=42)
-            elif self.model_choice == "NMF":
-                return NMF(n_components=self.encoding_dim, random_state=42)
-        
-        elif self.task_type == 'anomaly_detection':
-            if self.model_choice == "Isolation Forest":
-                return IsolationForest(random_state=42)
-            elif self.model_choice == "One-Class SVM":
-                return OneClassSVM()
-            elif self.model_choice == "Local Outlier Factor":
-                return LocalOutlierFactor()
-            elif self.model_choice == "Elliptic Envelope":
-                return EllipticEnvelope(random_state=42)
-        
-        return None
+                init_kwargs['n_components'] = self.n_clusters
+
+        if self.task_type == 'anomaly_detection':
+            if self.model_choice == "Local Outlier Factor":
+                init_kwargs['novelty'] = True
+
+        return model_cls(**init_kwargs)
     
     def fit_with_tuning(self, X, y, cv_folds=5):
         """Fit model with hyperparameter tuning and cross-validation"""
-        start_time = time()
+        logger.info(
+            "Starting model fit for task_type=%s, model_choice=%s, enable_tuning=%s, tuning_trials=%s",
+            self.task_type,
+            self.model_choice,
+            self.enable_tuning,
+            self.tuning_trials
+        )
+        start_time = perf_counter()
+
+        def _get_cv_splitter(task_type, X_data, y_data, desired_folds):
+            if task_type != 'classification':
+                n_splits = min(max(2, desired_folds), X_data.shape[0])
+                return KFold(n_splits=n_splits, shuffle=True, random_state=DEFAULT_RANDOM_STATE)
+
+            y_series = pd.Series(y_data)
+            class_counts = y_series.value_counts()
+            min_class_count = int(class_counts.min()) if not class_counts.empty else 0
+            n_classes = int(class_counts.shape[0])
+
+            if n_classes >= 2 and min_class_count >= 2:
+                n_splits = min(max(2, desired_folds), X_data.shape[0], min_class_count)
+                return StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=DEFAULT_RANDOM_STATE)
+
+            # Fallback to regular KFold when stratification is not possible.
+            n_splits = min(max(2, desired_folds), X_data.shape[0])
+            return KFold(n_splits=n_splits, shuffle=True, random_state=DEFAULT_RANDOM_STATE)
         
         if not self.enable_tuning or X.shape[0] < 100:
             # Use base model for small datasets
@@ -714,9 +510,7 @@ class EnhancedAutoMLModel:
             
             # Compute cross-validation scores for supervised tasks
             if self.task_type in ['classification', 'regression']:
-                cv = StratifiedKFold(n_splits=min(3, X.shape[0]), shuffle=True, random_state=42) \
-                    if self.task_type == 'classification' else \
-                    KFold(n_splits=min(3, X.shape[0]), shuffle=True, random_state=42)
+                cv = _get_cv_splitter(self.task_type, X, y, desired_folds=3)
                 
                 scoring = 'accuracy' if self.task_type == 'classification' else 'r2'
                 self.cv_scores = cross_val_score(self.model, X, y, cv=cv, scoring=scoring, n_jobs=-1)
@@ -726,27 +520,43 @@ class EnhancedAutoMLModel:
             param_grid = self._get_hyperparameter_grid()
             
             if param_grid and self.task_type in ['classification', 'regression']:
-                cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42) \
-                    if self.task_type == 'classification' else \
-                    KFold(n_splits=cv_folds, shuffle=True, random_state=42)
+                effective_folds = cv_folds
+                cv = _get_cv_splitter(self.task_type, X, y, desired_folds=effective_folds)
                 
                 scoring = 'accuracy' if self.task_type == 'classification' else 'r2'
                 
-                search = RandomizedSearchCV(
-                    base_model, param_grid,
-                    n_iter=5,
-                    cv=cv,
-                    scoring=scoring,
-                    n_jobs=-1,
-                    random_state=42,
-                    verbose=0
+                def _optuna_objective(trial):
+                    trial_params = {}
+                    for param_name, param_values in param_grid.items():
+                        if isinstance(param_values, list):
+                            trial_params[param_name] = trial.suggest_categorical(param_name, param_values)
+                        elif isinstance(param_values, tuple) and len(param_values) == 2:
+                            low, high = param_values
+                            if isinstance(low, int) and isinstance(high, int):
+                                trial_params[param_name] = trial.suggest_int(param_name, low, high)
+                            else:
+                                trial_params[param_name] = trial.suggest_float(param_name, low, high)
+                        else:
+                            raise ValueError(f"Unsupported hyperparameter format for {param_name}: {param_values}")
+
+                    trial_model = clone(base_model).set_params(**trial_params)
+                    scores = cross_val_score(trial_model, X, y, cv=cv, scoring=scoring, n_jobs=1)
+                    return float(np.mean(scores))
+
+                study = optuna.create_study(
+                    direction='maximize',
+                    sampler=optuna.samplers.TPESampler(seed=DEFAULT_RANDOM_STATE)
                 )
-                
-                search.fit(X, y)
-                
-                self.model = search.best_estimator_
-                self.best_params = search.best_params_
-                self.cv_scores = search.cv_results_['mean_test_score']
+                study.optimize(_optuna_objective, n_trials=self.tuning_trials)
+
+                self.best_params = study.best_params
+                self.model = clone(base_model).set_params(**self.best_params)
+                self.model.fit(X, y)
+
+                try:
+                    self.cv_scores = cross_val_score(self.model, X, y, cv=cv, scoring=scoring, n_jobs=-1)
+                except Exception:
+                    self.cv_scores = np.array([float(study.best_value)])
             elif self.task_type == 'clustering' and param_grid:
                 # For clustering, we need to evaluate different number of clusters
                 best_score = -1
@@ -754,7 +564,7 @@ class EnhancedAutoMLModel:
                 best_params = {}
                 
                 for n_clusters in param_grid.get('n_clusters', [2, 3, 4, 5]):
-                    model = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+                    model = KMeans(n_clusters=n_clusters, random_state=DEFAULT_RANDOM_STATE, n_init=10)
                     model.fit(X)
                     
                     # Evaluate clustering quality
@@ -779,7 +589,13 @@ class EnhancedAutoMLModel:
                 elif self.task_type in ['clustering', 'dimensionality_reduction']:
                     self.model.fit(X)
         
-        training_time = time() - start_time
+        training_time = perf_counter() - start_time
+        logger.info(
+            "Completed model fit in %.3f seconds. Best params=%s cv_scores=%s",
+            training_time,
+            self.best_params,
+            getattr(self, 'cv_scores', None)
+        )
         return training_time
     
     def get_model(self):
@@ -905,6 +721,64 @@ class LocalDatasetAnalyzer:
                 strengths.append("Dataset structure is generally suitable for machine learning.")
         return score, issues, strengths
 
+    def _compute_dataset_scores(self, df: pd.DataFrame, summary: Dict, task_type: str) -> Dict[str, float]:
+        """Compute nonlinearity, sparsity, and outlier scores for model recommendation."""
+        target_name = summary.get("target_analysis", {}).get("name")
+        X = df.copy()
+        y = None
+        if target_name and target_name in df.columns:
+            y = df[target_name].dropna()
+            X = df.drop(columns=[target_name]).loc[y.index]
+
+        numeric_features = X.select_dtypes(include=np.number).columns.tolist()
+        if numeric_features:
+            nonzero_ratio = np.count_nonzero(X[numeric_features]) / max(X[numeric_features].size, 1)
+            sparsity = 1.0 - nonzero_ratio
+
+            try:
+                kurt_vals = stats.kurtosis(X[numeric_features], axis=0, nan_policy="omit")
+                skew_vals = stats.skew(X[numeric_features], axis=0, nan_policy="omit")
+                kurt_vals = np.nan_to_num(kurt_vals)
+                skew_vals = np.nan_to_num(skew_vals)
+                kurt_norm = np.minimum(1.0, np.mean(np.abs(kurt_vals)) / 10.0)
+                skew_norm = np.minimum(1.0, np.mean(np.abs(skew_vals)) / 5.0)
+                outlier_score = (kurt_norm + skew_norm) / 2.0
+            except Exception:
+                outlier_score = 0.0
+        else:
+            sparsity = 0.0
+            outlier_score = 0.0
+
+        nonlinearity_score = 0.0
+        if y is not None and numeric_features:
+            try:
+                if task_type == 'classification':
+                    y_encoded = pd.factorize(y)[0]
+                    mi_vals = mutual_info_classif(X[numeric_features], y_encoded, discrete_features='auto')
+                else:
+                    mi_vals = mutual_info_regression(X[numeric_features], y)
+                mi_vals = np.nan_to_num(mi_vals, nan=0.0, posinf=0.0, neginf=0.0)
+                mi_norm = mi_vals / (np.max(mi_vals) + 1e-8)
+                mi_score = np.mean(mi_norm)
+
+                corr_vals = []
+                for col in numeric_features:
+                    if X[col].nunique(dropna=False) > 1:
+                        corr = np.corrcoef(X[col].fillna(X[col].mean()), y.astype(float).fillna(y.mean()))[0, 1]
+                        corr_vals.append(abs(corr) if not np.isnan(corr) else 0.0)
+                corr_score = np.mean(corr_vals) if corr_vals else 0.0
+                correlation_gap = max(0.0, mi_score - corr_score)
+                nonlinearity_score = min(1.0, 0.6 * mi_score + 0.4 * correlation_gap)
+            except Exception:
+                nonlinearity_score = 0.0
+
+        return {
+            'nonlinearity': float(nonlinearity_score),
+            'sparsity': float(sparsity),
+            'outlier': float(outlier_score),
+            'nonzero_ratio': float(nonzero_ratio if numeric_features else 1.0)
+        }
+
     def _generate_algorithm_recommendations(self, df: pd.DataFrame, summary: Dict,
                                              task_type: str) -> Dict[str, List]:
         """Generate data-driven algorithm recommendations with estimated performance ranges."""
@@ -915,6 +789,12 @@ class LocalDatasetAnalyzer:
         size_factor = 0.75 if n < 100 else (0.88 if n < 500 else 1.0)
         quality_factor = max(0.80, 1.0 - missing_pct * 0.5)
         factor = size_factor * quality_factor
+
+        scores = self._compute_dataset_scores(df, summary, task_type)
+        nonlinearity = scores["nonlinearity"]
+        sparsity = scores["sparsity"]
+        outlier = scores["outlier"]
+        density = scores["nonzero_ratio"]
 
         def acc_range(base: float, spread: float = 0.05) -> str:
             lo = max(40, int((base - spread) * 100))
@@ -927,75 +807,127 @@ class LocalDatasetAnalyzer:
         base_acc = min(0.90, 0.80 * factor)
         base_r2 = min(0.88, 0.72 * factor)
 
-        recs: Dict[str, List] = {
-            "classification": [
-                {"algorithm": "Auto-Ensemble",
-                 "estimated_accuracy": acc_range(base_acc),
-                 "reason": "Combines Random Forest, XGBoost, and Logistic Regression for maximum robustness."},
-                {"algorithm": "XGBoost",
-                 "estimated_accuracy": acc_range(base_acc - 0.04),
-                 "reason": "Gradient boosting excels at capturing complex non-linear patterns in tabular data."},
-                {"algorithm": "Random Forest",
-                 "estimated_accuracy": acc_range(base_acc - 0.07),
-                 "reason": "Robust ensemble with good generalization and built-in feature importance."},
-                {"algorithm": "Logistic Regression",
-                 "estimated_accuracy": acc_range(base_acc - 0.13),
-                 "reason": "Fast and interpretable — strong baseline when class separation is approximately linear."},
-            ],
-            "regression": [
-                {"algorithm": "Auto-Ensemble",
-                 "estimated_r2": r2_range(base_r2),
-                 "reason": "Ensemble of RF, XGBoost, and Ridge combines the strength of multiple learners."},
-                {"algorithm": "XGBoost",
-                 "estimated_r2": r2_range(base_r2 - 0.06),
-                 "reason": "High performance on non-linear regression tasks with structured data."},
-                {"algorithm": "Random Forest",
-                 "estimated_r2": r2_range(base_r2 - 0.10),
-                 "reason": "Robust to outliers; captures complex feature interactions without manual scaling."},
-                {"algorithm": "Linear Regression",
-                 "estimated_r2": r2_range(base_r2 - 0.20),
-                 "reason": "Excellent interpretable baseline for datasets with linear feature-target relationships."},
-            ],
-            "clustering": [
-                {"algorithm": "K-Means",         "estimated_silhouette": "0.30-0.55",
+        if task_type == 'classification':
+            algos = [
+                {
+                    "algorithm": "XGBoost",
+                    "score": base_acc - 0.04 + 0.05 * nonlinearity + 0.02 * outlier,
+                    "reason": (
+                        "High nonlinearity detected; boosting models are preferred."
+                        if nonlinearity > 0.45 else
+                        "Good choice for moderate nonlinearity with structured tabular data."
+                    )
+                },
+                {
+                    "algorithm": "LightGBM",
+                    "score": base_acc - 0.08 + 0.05 * nonlinearity + 0.01 * (1 - sparsity),
+                    "reason": (
+                        "LightGBM is recommended for large datasets with complex interactions."
+                        if nonlinearity > 0.35 else
+                        "Strong gradient boosting option with efficient training."
+                    )
+                },
+                {
+                    "algorithm": "Random Forest",
+                    "score": base_acc - 0.07 + 0.03 * outlier + 0.01 * (1 - sparsity),
+                    "reason": (
+                        "Robust to outliers and mixed feature types."
+                        if outlier > 0.35 else
+                        "Versatile ensemble for general-purpose classification."
+                    )
+                },
+                {
+                    "algorithm": "Gradient Boosting",
+                    "score": base_acc - 0.10 + 0.04 * nonlinearity,
+                    "reason": "Effective boosted trees for non-linear relationships and medium-sized datasets."
+                },
+                {
+                    "algorithm": "Logistic Regression",
+                    "score": base_acc - 0.13 + 0.03 * (1 - nonlinearity) + 0.02 * (1 - sparsity),
+                    "reason": (
+                        "High sparsity and linear structure favor logistic regression."
+                        if sparsity > 0.6 else
+                        "Simple and interpretable baseline for classification."
+                    )
+                },
+            ]
+        elif task_type == 'regression':
+            algos = [
+                {
+                    "algorithm": "XGBoost",
+                    "score": base_r2 - 0.06 + 0.05 * nonlinearity + 0.02 * outlier,
+                    "reason": (
+                        "High nonlinearity detected; boosting models are preferred."
+                        if nonlinearity > 0.45 else
+                        "Strong non-linear regression model for structured data."
+                    )
+                },
+                {
+                    "algorithm": "Gradient Boosting",
+                    "score": base_r2 - 0.12 + 0.04 * nonlinearity,
+                    "reason": "Good choice for capturing moderate non-linear relationships in regression tasks."
+                },
+                {
+                    "algorithm": "Random Forest",
+                    "score": base_r2 - 0.10 + 0.03 * outlier,
+                    "reason": "Robust to outliers and effective for mixed-feature regression."
+                },
+                {
+                    "algorithm": "Ridge Regression",
+                    "score": base_r2 - 0.18 + 0.03 * (1 - nonlinearity),
+                    "reason": (
+                        "Regularized linear model for stable performance on moderately linear data."
+                        if nonlinearity < 0.35 else
+                        "Good linear baseline when the signal is not strongly non-linear."
+                    )
+                },
+                {
+                    "algorithm": "Linear Regression",
+                    "score": base_r2 - 0.20 + 0.02 * (1 - nonlinearity),
+                    "reason": "Interpretable baseline for predominantly linear relationships."
+                },
+            ]
+        else:
+            algos = []
+
+        recommendations: Dict[str, List] = {"classification": [], "regression": [],
+                                           "clustering": [], "dimensionality_reduction": [],
+                                           "anomaly_detection": []}
+
+        if task_type in ['classification', 'regression']:
+            if task_type == 'classification':
+                recs = []
+                for item in sorted(algos, key=lambda x: x["score"], reverse=True):
+                    recs.append({
+                        "algorithm": item["algorithm"],
+                        "estimated_accuracy": acc_range(item["score"]),
+                        "reason": item["reason"],
+                        "calibrated_numeric": self.calibrator.calibrate_estimate(acc_range(item["score"]), task_type)
+                    })
+                recommendations[task_type] = recs
+            else:
+                recs = []
+                for item in sorted(algos, key=lambda x: x["score"], reverse=True):
+                    recs.append({
+                        "algorithm": item["algorithm"],
+                        "estimated_r2": r2_range(item["score"]),
+                        "reason": item["reason"],
+                        "calibrated_numeric": self.calibrator.calibrate_estimate(r2_range(item["score"]), task_type)
+                    })
+                recommendations[task_type] = recs
+        else:
+            recommendations[task_type] = [
+                {"algorithm": "K-Means", "estimated_silhouette": "0.30-0.55",
                  "reason": "Fast and scalable — best for compact, spherical clusters."},
-                {"algorithm": "DBSCAN",           "estimated_silhouette": "0.20-0.45",
+                {"algorithm": "DBSCAN", "estimated_silhouette": "0.20-0.45",
                  "reason": "Handles arbitrary cluster shapes and identifies noise/outliers."},
-                {"algorithm": "Hierarchical",     "estimated_silhouette": "0.25-0.50",
+                {"algorithm": "Hierarchical", "estimated_silhouette": "0.25-0.50",
                  "reason": "No need to pre-specify cluster count; produces an informative dendrogram."},
                 {"algorithm": "Gaussian Mixture", "estimated_silhouette": "0.25-0.48",
                  "reason": "Soft probabilistic assignments with flexible covariance shapes."},
-            ],
-            "dimensionality_reduction": [
-                {"algorithm": "PCA",   "estimated_variance": "65-85%",
-                 "reason": "Linear reduction preserving maximum variance; fastest and most interpretable."},
-                {"algorithm": "UMAP",  "estimated_variance": "70-88%",
-                 "reason": "Non-linear; preserves both global and local structure — ideal for visualization."},
-                {"algorithm": "t-SNE", "estimated_variance": "60-80%",
-                 "reason": "High-quality 2D/3D visualization by preserving local neighborhood structure."},
-                {"algorithm": "ICA",   "estimated_variance": "60-78%",
-                 "reason": "Finds statistically independent source components; useful for signal separation."},
-            ],
-            "anomaly_detection": [
-                {"algorithm": "Isolation Forest",     "estimated_precision": "75-85%",
-                 "reason": "Efficient for high-dimensional data; isolates anomalies using random splits."},
-                {"algorithm": "Local Outlier Factor",  "estimated_precision": "70-80%",
-                 "reason": "Density-based detection; identifies anomalies relative to local neighborhood."},
-                {"algorithm": "One-Class SVM",         "estimated_precision": "65-78%",
-                 "reason": "Learns a compact boundary around normal data; effective in high dimensions."},
-                {"algorithm": "Elliptic Envelope",     "estimated_precision": "65-75%",
-                 "reason": "Assumes Gaussian distribution; efficient for unimodal, low-dimensional data."},
-            ],
-        }
+            ]
 
-        for algo in recs["classification"]:
-            algo["calibrated_numeric"] = self.calibrator.calibrate_estimate(
-                algo["estimated_accuracy"], "classification")
-        for algo in recs["regression"]:
-            algo["calibrated_numeric"] = self.calibrator.calibrate_estimate(
-                algo["estimated_r2"], "regression")
-
-        return recs
+        return recommendations
 
     def _generate_preprocessing_recommendations(self, summary: Dict) -> List[str]:
         recs = ["StandardScaler applied to normalize all numerical features."]
@@ -1060,8 +992,8 @@ class LocalDatasetAnalyzer:
 
     def _generate_next_steps(self, summary: Dict, task_type: str) -> List[str]:
         steps = [
-            "Run 'Analyze Dataset Patterns' for statistical insights before selecting a model.",
-            "Use 'Run Pilot Benchmark' to quickly compare representative model performance.",
+            "Use 'Run Guided AutoML Pipeline' to run insights, benchmark, and training in one workflow.",
+            "Review the benchmark and recommendation cards before final model selection.",
         ]
         if task_type == "classification":
             steps.append("For imbalanced classes, enable 'Handle class imbalance' in the training options.")
@@ -1089,7 +1021,6 @@ class LocalDatasetAnalyzer:
         n, m = df.shape
         task_display = task_type.replace("_", " ").title() if task_type else "Unknown"
         md = (
-            f"## Analysis Summary\n\n"
             f"**Dataset:** {n:,} rows × {m} columns  \n"
             f"**Detected Task:** {task_display}  \n"
             f"**Quality Score:** {quality_score}/100\n\n"
@@ -1134,17 +1065,15 @@ class LocalDatasetAnalyzer:
 def perform_clustering(X, algorithm='K-Means', n_clusters=3):
     """Perform clustering on the dataset"""
     if algorithm == 'K-Means':
-        model = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        model = KMeans(n_clusters=n_clusters, random_state=DEFAULT_RANDOM_STATE, n_init=10)
     elif algorithm == 'DBSCAN':
         model = DBSCAN(eps=0.5, min_samples=5)
     elif algorithm == 'Hierarchical':
         model = AgglomerativeClustering(n_clusters=n_clusters)
-    elif algorithm == 'Spectral':
-        model = SpectralClustering(n_clusters=n_clusters, random_state=42)
     elif algorithm == 'Gaussian Mixture':
-        model = GaussianMixture(n_components=n_clusters, random_state=42)
+        model = GaussianMixture(n_components=n_clusters, random_state=DEFAULT_RANDOM_STATE)
     else:
-        model = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        model = KMeans(n_clusters=n_clusters, random_state=DEFAULT_RANDOM_STATE, n_init=10)
     
     labels = model.fit_predict(X)
     
@@ -1171,17 +1100,17 @@ def perform_clustering(X, algorithm='K-Means', n_clusters=3):
 def perform_dimensionality_reduction(X, algorithm='PCA', n_components=2):
     """Perform dimensionality reduction on the dataset"""
     if algorithm == 'PCA':
-        model = PCA(n_components=n_components, random_state=42)
+        model = PCA(n_components=n_components, random_state=DEFAULT_RANDOM_STATE)
     elif algorithm == 't-SNE':
-        model = TSNE(n_components=n_components, random_state=42, perplexity=30)
+        model = TSNE(n_components=n_components, random_state=DEFAULT_RANDOM_STATE, perplexity=30)
     elif algorithm == 'UMAP':
-        model = UMAP(n_components=n_components, random_state=42)
+        model = UMAP(n_components=n_components, random_state=DEFAULT_RANDOM_STATE)
     elif algorithm == 'ICA':
-        model = FastICA(n_components=n_components, random_state=42)
+        model = FastICA(n_components=n_components, random_state=DEFAULT_RANDOM_STATE)
     elif algorithm == 'NMF':
-        model = NMF(n_components=n_components, random_state=42)
+        model = NMF(n_components=n_components, random_state=DEFAULT_RANDOM_STATE)
     else:
-        model = PCA(n_components=n_components, random_state=42)
+        model = PCA(n_components=n_components, random_state=DEFAULT_RANDOM_STATE)
     
     X_reduced = model.fit_transform(X)
     
@@ -1195,15 +1124,11 @@ def perform_dimensionality_reduction(X, algorithm='PCA', n_components=2):
 def perform_anomaly_detection(X, algorithm='Isolation Forest', contamination=0.1):
     """Perform anomaly detection on the dataset"""
     if algorithm == 'Isolation Forest':
-        model = IsolationForest(contamination=contamination, random_state=42)
-    elif algorithm == 'One-Class SVM':
-        model = OneClassSVM()
+        model = IsolationForest(contamination=contamination, random_state=DEFAULT_RANDOM_STATE)
     elif algorithm == 'Local Outlier Factor':
         model = LocalOutlierFactor(contamination=contamination, novelty=True)
-    elif algorithm == 'Elliptic Envelope':
-        model = EllipticEnvelope(contamination=contamination, random_state=42)
     else:
-        model = IsolationForest(contamination=contamination, random_state=42)
+        model = IsolationForest(contamination=contamination, random_state=DEFAULT_RANDOM_STATE)
     
     if algorithm == 'Local Outlier Factor':
         model.fit(X)
@@ -1221,7 +1146,7 @@ def plot_cluster_results(X, labels, algorithm_name):
     """Visualize clustering results"""
     # Reduce dimensions for visualization if needed
     if X.shape[1] > 2:
-        reducer = PCA(n_components=2, random_state=42)
+        reducer = PCA(n_components=2, random_state=DEFAULT_RANDOM_STATE)
         X_reduced = reducer.fit_transform(X)
     else:
         X_reduced = X
@@ -1252,7 +1177,7 @@ def plot_anomaly_detection(X, anomaly_labels, algorithm_name):
     """Visualize anomaly detection results"""
     # Reduce dimensions for visualization if needed
     if X.shape[1] > 2:
-        reducer = PCA(n_components=2, random_state=42)
+        reducer = PCA(n_components=2, random_state=DEFAULT_RANDOM_STATE)
         X_reduced = reducer.fit_transform(X)
     else:
         X_reduced = X
@@ -1451,7 +1376,7 @@ def enhanced_generate_report(model, X_test, y_test, task_type, cv_scores=None):
                 try:
                     # Sample if too large for silhouette score
                     if X_test.shape[0] > 5000:
-                        np.random.seed(42)
+                        np.random.seed(DEFAULT_RANDOM_STATE)
                         sample_indices = np.random.choice(X_test.shape[0], 5000, replace=False)
                         X_sample = X_test[sample_indices]
                         labels_sample = labels[sample_indices]
@@ -1483,12 +1408,7 @@ def enhanced_generate_report(model, X_test, y_test, task_type, cv_scores=None):
             }
             
         elif task_type == 'dimensionality_reduction':
-            if isinstance(model, LinearDiscriminantAnalysis):
-                if y_test is None:
-                    raise ValueError("LDA for dimensionality reduction requires target labels (y).")
-                transformed = model.fit_transform(X_test, y_test)
-            else:
-                transformed = model.fit_transform(X_test)
+            transformed = model.fit_transform(X_test)
             
             explained_variance = None
             if hasattr(model, 'explained_variance_ratio_'):
@@ -1606,8 +1526,6 @@ def plot_prediction_comparison(report):
 
 def display_gpt_analysis_results(analysis_result: Dict[str, Any], task_type: str = None):
     """Display analysis results in Streamlit"""
-    st.subheader("Intelligent Dataset Report")
-    
     if "error" in analysis_result:
         st.error(f"GPT Analysis Error: {analysis_result['error']}")
         return
@@ -1619,11 +1537,11 @@ def display_gpt_analysis_results(analysis_result: Dict[str, Any], task_type: str
         
         # Professional Alignment for Quality Section
         st.markdown(f"""
-        <div style="background: var(--glass-bg); padding: 1.5rem; border-radius: 12px; border: 1px solid var(--glass-border); margin-bottom: 2rem;">
+        <div style="background: var(--surface); padding: 1.5rem; border-radius: 12px; border: 1px solid var(--surface-border); margin-bottom: 2rem; box-shadow: var(--card-shadow);">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
                 <div>
-                    <h3 style="margin: 0; color: #94a3b8; font-size: 1.1rem; text-transform: uppercase; letter-spacing: 0.05em;">Dataset Reliability</h3>
-                    <div style="font-size: 3rem; font-weight: 800; color: #fff;">{score}<span style="font-size: 1.2rem; color: #64748b; font-weight: 400;">/100</span></div>
+                    <h3 style="margin: 0; color: var(--text-muted); font-size: 1.1rem; text-transform: uppercase; letter-spacing: 0.05em;">Dataset Reliability</h3>
+                    <div style="font-size: 3rem; font-weight: 800; color: var(--text-main);">{score}<span style="font-size: 1.2rem; color: var(--text-muted); font-weight: 400;">/100</span></div>
                 </div>
                 <div style="text-align: right;">
                     <span class="status-badge" style="background: {'rgba(34, 197, 94, 0.2)' if score >= 70 else 'rgba(234, 179, 8, 0.2)' if score >= 50 else 'rgba(239, 68, 68, 0.2)'}; color: {'#4ade80' if score >= 70 else '#facc15' if score >= 50 else '#f87171'}; border: 1px solid {'#22c55e' if score >= 70 else '#eab308' if score >= 50 else '#ef4444'};">
@@ -1646,7 +1564,7 @@ def display_gpt_analysis_results(analysis_result: Dict[str, Any], task_type: str
             ax.set_xlim(0, 100)
             ax.set_xticks([0, 25, 50, 75, 100])
             ax.set_yticks([])
-            ax.tick_params(colors='#94a3b8', labelsize=8)
+            ax.tick_params(colors='#64748b', labelsize=8)
             for spine in ax.spines.values():
                 spine.set_visible(False)
             st.pyplot(fig)
@@ -1665,7 +1583,8 @@ def display_gpt_analysis_results(analysis_result: Dict[str, Any], task_type: str
     
     # Algorithm Recommendations with Accuracy Estimates
     if "algorithm_recommendations" in analysis_result and task_type:
-        display_calibrated_accuracy_estimates(analysis_result, task_type)
+        with st.expander("Model Guidance", expanded=False):
+            display_calibrated_accuracy_estimates(analysis_result, task_type)
     
     # Other sections
     if "data_preprocessing_recommendations" in analysis_result:
@@ -1692,7 +1611,7 @@ def display_gpt_analysis_results(analysis_result: Dict[str, Any], task_type: str
             st.markdown(f"• {step}")
     
     if "estimated_training_time" in analysis_result:
-        st.markdown(f"**Projected Compute Time:** {analysis_result['estimated_training_time']}")
+        st.markdown(f"**Estimated Compute Time (projection):** {analysis_result['estimated_training_time']}")
     
     # Display markdown summary
     if "summary_markdown" in analysis_result:
@@ -1710,8 +1629,10 @@ class AutomatedAlgorithmBenchmarker:
         
     def analyze_dataset_stats(self, X, y=None):
         """Analyze statistical properties of the dataset"""
+        logger.info("Analyzing dataset stats for task type %s", self.task_type)
         stats_insights = []
-        if X is None: return stats_insights
+        if X is None:
+            return stats_insights
 
         n_samples, n_features = X.shape
         
@@ -1768,49 +1689,50 @@ class AutomatedAlgorithmBenchmarker:
     def run_pilot_benchmark(self, X, y):
         """Runs a quick benchmarking of representative models"""
         if X.shape[0] < 10:
+            logger.info("Pilot benchmark skipped: insufficient data (%s rows).", X.shape[0])
             return ["Dataset too small for reliable benchmarking pilot (less than 10 rows)."]
 
+        logger.info("Running pilot benchmark for %s samples, task type %s.", X.shape[0], self.task_type)
         results = []
-        # Sample data for performance (max 2000 rows)
         n_samples = X.shape[0]
         sample_size = min(2000, n_samples)
         
-        # Use simple slicing for speed and stability
         X_s = X[:sample_size] if isinstance(X, np.ndarray) else X.iloc[:sample_size]
         y_s = y[:sample_size] if isinstance(y, np.ndarray) else y.iloc[:sample_size]
 
-        with st.spinner(f"Running data-driven pilot benchmark on {sample_size} samples..."):
-            if self.task_type == 'classification':
-                models = {
-                    "Logistic Regression (Baseline)": LogisticRegression(max_iter=500),
-                    "Random Forest (Ensemble)": RandomForestClassifier(n_estimators=30, max_depth=8),
-                    "XGBoost (Boosting)": XGBClassifier(n_estimators=30, max_depth=4, verbosity=0)
-                }
-                scoring = 'accuracy'
-            elif self.task_type == 'regression':
-                models = {
-                    "Linear Regression (Baseline)": LinearRegression(),
-                    "Random Forest (Ensemble)": RandomForestRegressor(n_estimators=30, max_depth=8),
-                    "XGBoost (Boosting)": XGBRegressor(n_estimators=30, max_depth=4, verbosity=0)
-                }
-                scoring = 'r2'
-            else:
-                return ["Benchmarking not available for this task type."]
+        if self.task_type == 'classification':
+            models = {
+                "Logistic Regression (Baseline)": LogisticRegression(max_iter=500),
+                "Random Forest (Ensemble)": RandomForestClassifier(n_estimators=30, max_depth=8),
+                "XGBoost (Boosting)": XGBClassifier(n_estimators=30, max_depth=4, verbosity=0)
+            }
+            scoring = 'accuracy'
+        elif self.task_type == 'regression':
+            models = {
+                "Linear Regression (Baseline)": LinearRegression(),
+                "Random Forest (Ensemble)": RandomForestRegressor(n_estimators=30, max_depth=8),
+                "XGBoost (Boosting)": XGBRegressor(n_estimators=30, max_depth=4, verbosity=0)
+            }
+            scoring = 'r2'
+        else:
+            logger.warning("Pilot benchmark unavailable for task type %s.", self.task_type)
+            return ["Benchmarking not available for this task type."]
 
-            # Use 3-fold or simple 2-fold if data is very small
-            cv_val = 3 if sample_size >= 30 else 2
-            
-            for name, model in models.items():
-                try:
-                    scores = cross_val_score(model, X_s, y_s, cv=cv_val, scoring=scoring)
-                    results.append({'model': name, 'score': scores.mean()})
-                except:
-                    continue
+        cv_val = 3 if sample_size >= 30 else 2
+        for name, model in models.items():
+            try:
+                scores = cross_val_score(model, X_s, y_s, cv=cv_val, scoring=scoring)
+                average_score = float(scores.mean())
+                results.append({'model': name, 'score': average_score})
+                logger.info("Benchmark result: %s => %s", name, average_score)
+            except Exception as exc:
+                logger.warning("Benchmark failed for %s: %s", name, exc)
+                continue
 
         if not results:
+            logger.error("Pilot benchmark failed: no successful model evaluations.")
             return ["Benchmarking failed: Check data format."]
 
-        # Sort and return recommendations (provide top 3)
         sorted_results = sorted(results, key=lambda x: x['score'], reverse=True)
         recommendations = []
         icons = ["1.", "2.", "3."]
@@ -1822,32 +1744,173 @@ class AutomatedAlgorithmBenchmarker:
 
         if n_samples < 50:
             recommendations.insert(0, "**Note:** Results may be unstable due to small sample size.")
-            
+
         return recommendations
 
+@st.cache_data(show_spinner=False)
+def cached_analyze_dataset_stats(task_type, X, y=None):
+    logger.info("Cached dataset stats analysis for task_type=%s", task_type)
+    return AutomatedAlgorithmBenchmarker(task_type).analyze_dataset_stats(X, y)
+
+@st.cache_data(show_spinner=False)
+def cached_run_pilot_benchmark(task_type, X, y):
+    logger.info("Cached pilot benchmark for task_type=%s, samples=%s", task_type, X.shape[0])
+    return AutomatedAlgorithmBenchmarker(task_type).run_pilot_benchmark(X, y)
+
+@st.cache_data(show_spinner=False)
+def cached_dataset_analysis(df, target_col=None):
+    logger.info("Cached dataset analysis for dataframe shape=%s target=%s", df.shape, target_col)
+    return LocalDatasetAnalyzer().analyze_dataset(df, target_col)
+
+def run_supervised_guided_pipeline(
+    df, target_col, active_task_type, model_choice,
+    handle_imbalance, enable_feature_selection,
+    enable_hyperparameter_tuning, scaled_trials,
+    cv_folds, test_size_float
+):
+    """Run the guided supervised training pipeline outside Streamlit callbacks."""
+    logger.info(
+        "Executing guided supervised pipeline for target=%s, model=%s, task_type=%s",
+        target_col, model_choice, active_task_type
+    )
+
+    df_valid = df[df[target_col].notna()].copy()
+    y_raw = df_valid[target_col]
+    stratify = None
+    if active_task_type == 'classification':
+        class_counts = y_raw.value_counts()
+        if len(class_counts) >= 2 and int(class_counts.min()) >= 2:
+            stratify = y_raw
+
+    step_times = {}
+
+    step_start = perf_counter()
+    train_df, test_df = train_test_split(
+        df_valid,
+        test_size=test_size_float,
+        random_state=DEFAULT_RANDOM_STATE,
+        stratify=stratify
+    )
+    step_times['Train/Test split'] = perf_counter() - step_start
+    train_indices = train_df.index
+    test_indices = test_df.index
+
+    step_start = perf_counter()
+    split_preprocessor = EnhancedUniversalDataPreprocessor(
+        use_dense=True,
+        enable_feature_selection=enable_feature_selection
+    )
+    X_train, y_train, _, _ = split_preprocessor.process(
+        train_df.copy(),
+        target_col,
+        task_type_override=active_task_type
+    )
+    X_test, y_test, _, _ = split_preprocessor.transform(
+        test_df.copy(),
+        target_col,
+        task_type_override=active_task_type
+    )
+    step_times['Preprocessing'] = perf_counter() - step_start
+
+    automl_model = EnhancedAutoMLModel(
+        task_type=active_task_type,
+        model_choice=model_choice,
+        handle_imbalance=handle_imbalance if active_task_type == 'classification' else False,
+        enable_tuning=enable_hyperparameter_tuning,
+        tuning_trials=scaled_trials
+    )
+    training_time = automl_model.fit_with_tuning(X_train, y_train, cv_folds=cv_folds)
+    step_times['Model training'] = training_time
+    model = automl_model.get_model()
+
+    step_start = perf_counter()
+    report = enhanced_generate_report(
+        model, X_test, y_test, active_task_type,
+        cv_scores=automl_model.cv_scores
+    )
+    step_times['Evaluation'] = perf_counter() - step_start
+
+    return {
+        'model': model,
+        'preprocessor': split_preprocessor,
+        'report': report,
+        'training_time': training_time,
+        'automl_model': automl_model,
+        'train_indices': train_indices,
+        'test_indices': test_indices,
+        'step_times': step_times,
+        'X_test': X_test,
+        'y_test': y_test
+    }
+
 def get_model_downloads(model, task_type, model_name, model_choice, preprocessor=None):
-    """Generate download buttons for the trained model in various formats"""
+    """Generate download buttons for the trained model and preprocessing bundle."""
     st.subheader("Download Trained Model")
     
+    # Extract preprocessing components when available
+    scaler = None
+    encoder = None
+    feature_selector = None
+    metadata = {
+        'task_type': task_type,
+        'model_choice': model_choice,
+        'feature_names': None,
+        'feature_columns': None,
+        'dropped_constant_cols': None,
+        'dropped_high_card_cols': None,
+        'use_dense': None,
+        'enable_feature_selection': None,
+        'variance_threshold_used': None,
+        'label_classes': None,
+    }
+
+    if preprocessor is not None:
+        try:
+            scaler = preprocessor.preprocessor.named_transformers_['num']['scaler']
+        except Exception:
+            scaler = None
+        try:
+            encoder = preprocessor.preprocessor.named_transformers_['cat']['encoder']
+        except Exception:
+            encoder = None
+        feature_selector = getattr(preprocessor, 'feature_selector', None)
+        metadata.update({
+            'feature_names': getattr(preprocessor, 'feature_names', None),
+            'feature_columns': getattr(preprocessor, '_feature_columns', None),
+            'dropped_constant_cols': getattr(preprocessor, '_dropped_constant_cols', None),
+            'dropped_high_card_cols': getattr(preprocessor, '_dropped_high_card_cols', None),
+            'use_dense': getattr(preprocessor, 'use_dense', None),
+            'enable_feature_selection': getattr(preprocessor, 'enable_feature_selection', None),
+            'variance_threshold_used': getattr(preprocessor, '_variance_threshold_used', None),
+            'label_classes': getattr(getattr(preprocessor, 'label_encoder', None), 'classes_', None),
+        })
+
+    full_pipeline = {
+        'model': model,
+        'scaler': scaler,
+        'encoder': encoder,
+        'feature_selector': feature_selector,
+        'metadata': metadata,
+    }
+
     col1, col2 = st.columns(2)
-    
     base_key = f"{model_name}_{task_type}"
-    
+
     # Pickle format
-    model_bytes = pickle.dumps(model)
+    bundle_bytes = pickle.dumps(full_pipeline)
     with col1:
         st.download_button(
             label="Download as Pickle",
-            data=model_bytes,
+            data=bundle_bytes,
             file_name=f'{model_name}.pkl',
             mime='application/octet-stream',
             key=f"{base_key}_pkl"
         )
         st.caption("Standard Python serialization format")
-    
-    # Joblib format (better for large models)
+
+    # Joblib format bundle
     buffer = io.BytesIO()
-    joblib.dump(model, buffer)
+    joblib.dump(full_pipeline, buffer)
     with col2:
         st.download_button(
             label="Download as Joblib",
@@ -1856,7 +1919,7 @@ def get_model_downloads(model, task_type, model_name, model_choice, preprocessor
             mime='application/octet-stream',
             key=f"{base_key}_joblib"
         )
-        st.caption("Better for large numpy arrays")
+        st.caption("Bundle includes model, scaler, encoder, feature selector, and metadata")
 
 def enhanced_debug_data_quality(df, target_col=None):
     """Enhanced data quality debugging with preprocessing checks"""
@@ -1915,15 +1978,31 @@ def enhanced_debug_data_quality(df, target_col=None):
 
 # ==================== MAIN APPLICATION ====================
 def main():
+    # Session state initialization
+    if 'ui_theme' not in st.session_state:
+        st.session_state.ui_theme = "Light"
+
+    # Sidebar configuration
+    st.sidebar.title("VertexML")
+    st.sidebar.markdown("---")
+    st.sidebar.success("AI Engine Active (Local)")
+
+    st.sidebar.subheader("Interface")
+    selected_theme = st.sidebar.selectbox(
+        "Theme",
+        ["Light", "Dark"],
+        index=0 if st.session_state.ui_theme == "Light" else 1,
+        key="ui_theme_selector"
+    )
+    st.session_state.ui_theme = selected_theme
+    apply_custom_styles("dark" if st.session_state.ui_theme == "Dark" else "light")
+
     # Hero Section
     st.markdown("""
-    <div style="text-align: center; padding: 2rem 0; margin-bottom: 2rem;">
-        <h1 style="font-size: 4rem; font-weight: 800; margin-bottom: 0.5rem; background: linear-gradient(90deg, #fff 30%, #38bdf8 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
-            VertexML
-        </h1>
-        <p style="font-size: 1.4rem; color: #94a3b8; max-width: 100%; margin: 0 auto; line-height: 1.6; white-space: nowrap;">
-            A end to end model training platform
-        </p>
+    <div class="hero-panel">
+        <h1 class="hero-title">VertexML</h1>
+        <p class="hero-subtitle">End-to-end model training platform with guided workflows for first-time users.</p>
+        <div class="hero-badge">Guided AutoML Workspace</div>
     </div>
     """, unsafe_allow_html=True)
     
@@ -1932,11 +2011,16 @@ def main():
         'performance_calibrator': PerformanceCalibrator(),
         'actual_vs_estimated': [],
         'gpt_analysis': None,
+        'analysis_signature': None,
+        'analysis_target': None,
+        'supervised_suggestions_signature': None,
         'data_insights': None,
         'pilot_results': None,
         'clustering_insights': None,
         'dr_insights': None,
         'anomaly_insights': None,
+        'guided_pipeline_signature': None,
+        'guided_pipeline_results': None,
         'run_supervised_clicked': False,
         'run_clustering_clicked': False,
         'run_dr_clicked': False,
@@ -1946,16 +2030,24 @@ def main():
         if key not in st.session_state:
             st.session_state[key] = value
     
-    # Sidebar configuration
-    st.sidebar.title("VertexML")
-    st.sidebar.markdown("---")
-    st.sidebar.success("AI Engine Active (Local)")
-    
     # Enhanced configuration
     st.sidebar.subheader("Enhanced Settings")
     enable_hyperparameter_tuning = st.sidebar.checkbox("Enable Hyperparameter Tuning", value=True)
     enable_cross_validation = st.sidebar.checkbox("Enable Cross-Validation", value=True)
     enable_feature_selection = st.sidebar.checkbox("Enable Feature Selection", value=True)
+    training_depth = st.sidebar.selectbox(
+        "Training Depth",
+        ["Fast (seconds)", "Standard", "Thorough"],
+        index=0,
+        help="Higher depth explores more hyperparameter combinations and can take longer."
+    )
+
+    tuning_trials_map = {
+        "Fast (seconds)": 3,
+        "Standard": 8,
+        "Thorough": 20
+    }
+    tuning_trials = tuning_trials_map.get(training_depth, 15)
     
     # Initialize local analyzer (no external API required)
     analyzer = LocalDatasetAnalyzer()
@@ -1965,7 +2057,9 @@ def main():
         keys_to_reset = ['run_supervised_clicked', 'run_clustering_clicked', 
                         'run_dr_clicked', 'run_anomaly_clicked',
                         'data_insights', 'pilot_results', 'clustering_insights',
-                        'dr_insights', 'anomaly_insights']
+                        'dr_insights', 'anomaly_insights', 'analysis_target',
+                        'supervised_suggestions_signature', 'guided_pipeline_signature',
+                        'guided_pipeline_results']
         for key in keys_to_reset:
             if key in st.session_state:
                 st.session_state[key] = False if 'clicked' in key else None
@@ -2010,16 +2104,33 @@ def main():
                              "Anomaly Detection"],
                             horizontal=True, key="task_type_radio", on_change=reset_all_runs)
 
-        # Data-Driven Analysis Report (fully local, no API key needed)
-        if st.button("Generate Intelligent Report", key="analyze_gpt"):
-            with st.spinner("Analyzing dataset patterns and structures..."):
-                analysis_result = analyzer.analyze_dataset(df)
-                
+        st.markdown("""
+        <div class='action-panel'>
+            <p class='action-panel-title'>Dataset Intelligence Center</p>
+            <p class='action-panel-text'>Your report is generated automatically. Choose a target, review the guidance if needed, then start the guided training workflow.</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Auto-generate Data-Driven Analysis Report (fully local, no API key needed)
+        current_signature = f"{uploaded_file.name}:{uploaded_file.size}:{df.shape[0]}:{df.shape[1]}"
+        if st.session_state.get('analysis_signature') != current_signature:
+            with st.spinner("Building dataset intelligence report..."):
+                analysis_result = cached_dataset_analysis(df)
+
                 if "error" not in analysis_result:
-                    st.success("Report generated successfully!")
                     st.session_state.gpt_analysis = analysis_result
+                    st.session_state.analysis_signature = current_signature
                 else:
                     st.error(f"Analysis Error: {analysis_result['error']}")
+
+        analysis_target = None
+        if task_type == "Supervised Learning" and 'target_col' in st.session_state:
+            analysis_target = st.session_state.get('target_col')
+            if analysis_target and st.session_state.get('analysis_target') != analysis_target:
+                refreshed_analysis = cached_dataset_analysis(df, analysis_target)
+                if "error" not in refreshed_analysis:
+                    st.session_state.gpt_analysis = refreshed_analysis
+                    st.session_state.analysis_target = analysis_target
         
         # Persistently display report if it exists
         if st.session_state.gpt_analysis:
@@ -2027,7 +2138,10 @@ def main():
                 # Determine current task type for calibrated suggestions
                 display_task = None
                 if task_type == "Supervised Learning":
-                    display_task = st.session_state.get('manual_task_mode', 'classification').lower()
+                    if analysis_target and st.session_state.gpt_analysis.get('summary_markdown'):
+                        display_task = st.session_state.get('manual_task_mode', 'classification').lower()
+                    else:
+                        display_task = st.session_state.get('manual_task_mode', 'classification').lower()
                 elif task_type == "Clustering":
                     display_task = 'clustering'
                 elif task_type == "Dimensionality Reduction":
@@ -2046,8 +2160,7 @@ def main():
                 target_col = st.selectbox("Select target column", df.columns, 
                                          key="target_col", on_change=reset_all_runs)
             with col2:
-                # User request: Provide 2 options 1)Classification 2)Regression before suggesting algorithm
-                manual_task_mode = st.radio("Select task mode:", ["Classification", "Regression"], 
+                manual_task_mode = st.radio("Prediction goal:", ["Auto (Recommended)", "Classification", "Regression"], 
                                            horizontal=True, key="manual_task_mode")
             
             if target_col:
@@ -2057,12 +2170,23 @@ def main():
                     X, y, detected_task_type, indices, preprocessor = \
                         proc_res['X'], proc_res['y'], proc_res['task_type'], proc_res['indices'], proc_res['preprocessor']
                     
-                    # Override detected type with manual choice if they differ
-                    active_task_type = manual_task_mode.lower()
+                    # Beginner-friendly mode selection with safety fallback.
+                    active_task_type = detected_task_type if manual_task_mode == "Auto (Recommended)" else manual_task_mode.lower()
+
+                    if active_task_type == 'classification':
+                        y_series = pd.Series(y)
+                        unique_classes = int(y_series.nunique())
+                        unique_ratio = unique_classes / max(len(y_series), 1)
+                        if pd.api.types.is_numeric_dtype(y_series) and unique_classes > 20 and unique_ratio > 0.2:
+                            st.warning(
+                                "Classification was selected, but the target behaves like a continuous variable "
+                                "(many unique numeric values). Switched to regression automatically."
+                            )
+                            active_task_type = 'regression'
                     
                     st.markdown(f"""
-                        <div style='background: rgba(56, 189, 248, 0.1); padding: 1rem; border-radius: 10px; border: 1px solid rgba(56, 189, 248, 0.2); margin-bottom: 1rem;'>
-                            <span style='color: #38bdf8; font-weight: 600;'>Preprocessing Complete:</span> 
+                        <div class='info-banner'>
+                            <strong>Preprocessing Complete:</strong>
                             Dataset optimized for <b>{active_task_type}</b>.
                         </div>
                     """, unsafe_allow_html=True)
@@ -2081,53 +2205,72 @@ def main():
                     st.subheader("Data-Driven Algorithm Discovery")
                     
                     benchmarker = AutomatedAlgorithmBenchmarker(active_task_type)
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        if st.button("Analyze Dataset Patterns", key="analyze_patterns"):
-                            st.session_state.data_insights = benchmarker.analyze_dataset_stats(X, y)
+                    suggestions_signature = f"{current_signature}:{target_col}:{active_task_type}:{len(y)}:{X.shape[1]}"
+
+                    # Generate guidance before training so users can review suggestions first.
+                    if st.session_state.get('supervised_suggestions_signature') != suggestions_signature:
+                        with st.spinner("Preparing pre-training guidance..."):
+                            st.session_state.data_insights = cached_analyze_dataset_stats(active_task_type, X, y)
                             if not st.session_state.data_insights:
-                                st.session_state.data_insights = ["Standard dataset structure detected. No extreme outliers or sparsity issues identified."]
-                    with col2:
-                        if st.button("Run Pilot Benchmark", key="run_pilot"):
-                            st.session_state.pilot_results = benchmarker.run_pilot_benchmark(X, y)
-                    
-                    # Display Insights
-                    if st.session_state.get('data_insights'):
-                        with st.expander("Statistical Insights", expanded=True):
-                            for insight in st.session_state.data_insights:
-                                st.write(f"• {insight}")
-                    
-                    # Display Pilot Results
-                    if st.session_state.get('pilot_results'):
-                        with st.expander("Benchmarking Pilot Results", expanded=True):
-                            for res in st.session_state.pilot_results:
-                                st.write(f"• {res}")
-                            st.info("Auto-Ensemble is recommended to combine these strengths.")
-                    
-                    # AI Recommendations
+                                st.session_state.data_insights = [
+                                    "Standard dataset structure detected. No extreme outliers or sparsity issues identified."
+                                ]
+                            st.session_state.pilot_results = cached_run_pilot_benchmark(active_task_type, X, y)
+                            st.session_state.supervised_suggestions_signature = suggestions_signature
+
+                    st.markdown("""
+                    <div class='action-panel'>
+                        <p class='action-panel-title'>Training First</p>
+                        <p class='action-panel-text'>The primary action below trains the model first. Guidance and benchmark summaries are shown before training for quick review.</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    # Optional guidance, kept secondary to the training workflow.
+                    gpt_suggestions = []
                     if st.session_state.gpt_analysis:
                         gpt_suggestions = st.session_state.gpt_analysis.get('algorithm_recommendations', {}).get(active_task_type, [])
-                        
-                        if gpt_suggestions:
-                            with st.expander("AI Recommended Algorithms (Calibrated)", expanded=True):
+
+                    has_dataset_checks = bool(st.session_state.get('data_insights') or st.session_state.get('pilot_results'))
+                    if gpt_suggestions or has_dataset_checks:
+                        with st.expander("Model Recommendation Brief", expanded=False):
+                            if gpt_suggestions:
+                                st.markdown("**Recommended Models**")
                                 for suggestion in gpt_suggestions[:3]:
                                     perf_str = get_performance_string(suggestion, active_task_type)
-                                    st.write(f"**{suggestion['algorithm']}** - {perf_str}")
+                                    st.write(f"• **{suggestion['algorithm']}** - {perf_str}")
+
+                            if st.session_state.get('data_insights') or st.session_state.get('pilot_results'):
+                                st.markdown("**Validation Summary**")
+
+                            if st.session_state.get('data_insights'):
+                                for insight in st.session_state.data_insights:
+                                    st.write(f"• {insight}")
+
+                            if st.session_state.get('pilot_results'):
+                                for res in st.session_state.pilot_results:
+                                    cleaned_result = str(res)
+                                    cleaned_result = cleaned_result.replace("Est. Accuracy/Score", "Estimated score")
+                                    cleaned_result = cleaned_result.replace("Pilot Benchmark", "Validation")
+                                    cleaned_result = cleaned_result.replace("1. ", "")
+                                    cleaned_result = cleaned_result.replace("2. ", "")
+                                    cleaned_result = cleaned_result.replace("3. ", "")
+                                    st.write(f"• {cleaned_result}")
+
+                            st.info("These recommendations are prepared before training to help you choose a stronger starting model.")
                     
                     # Model selection
                     if active_task_type == 'classification':
                         models = [
-                            "Auto-Ensemble", "Random Forest", "XGBoost", "Logistic Regression", 
-                            "Gradient Boosting", "LightGBM", "SVM", "k-NN"
+                            "Random Forest", "XGBoost", "Logistic Regression",
+                            "Gradient Boosting", "LightGBM", "SVM"
                         ]
                         default_idx = 0
                         handle_imbalance = st.checkbox("Handle class imbalance", 
                                                       value=y.value_counts(normalize=True).max() > 0.7)
                     else:
                         models = [
-                            "Auto-Ensemble", "Random Forest", "XGBoost", "Linear Regression",
-                            "Gradient Boosting", "LightGBM", "Ridge Regression"
+                            "Random Forest", "XGBoost", "Linear Regression",
+                            "Gradient Boosting", "Ridge Regression"
                         ]
                         default_idx = 0
                         handle_imbalance = False
@@ -2145,9 +2288,17 @@ def main():
                     with col2:
                         cv_folds = st.slider("Cross-validation folds", 3, 10, 5, 
                                             disabled=not enable_cross_validation)
+
+                    # Scale the search effort to the uploaded dataset size.
+                    dataset_size = len(y)
+                    feature_count = X.shape[1]
+                    scaled_trials = max(
+                        tuning_trials,
+                        min(20, max(4, dataset_size // 400 + feature_count // 40))
+                    )
                     
                     # Run button
-                    if st.button("Run Enhanced Pipeline", key="run_enhanced"):
+                    if st.button("Run Guided AutoML Pipeline", key="run_enhanced"):
                         st.session_state.run_supervised_clicked = True
                         
                 except Exception as e:
@@ -2158,53 +2309,81 @@ def main():
                 if st.session_state.run_supervised_clicked:
                     with st.spinner("Optimizing pipeline performance..."):
                         try:
-                            # Immediate reset to prevent double-runs on other UI clicks
-                            # (but we keep the logic inside this branch for the remainder of this run)
-                            
-                            # Step 1: Preprocessing (Retrieved from cache)
+                            st.session_state.run_supervised_clicked = False
+
+                            pipeline_signature = hashlib.sha256(
+                                str(
+                                    (
+                                        uploaded_file.name,
+                                        uploaded_file.size,
+                                        target_col,
+                                        active_task_type,
+                                        model_choice,
+                                        handle_imbalance,
+                                        enable_hyperparameter_tuning,
+                                        scaled_trials,
+                                        cv_folds,
+                                        test_size_float,
+                                        enable_feature_selection
+                                    )
+                                ).encode('utf-8')
+                            ).hexdigest()
+
+                            if st.session_state.guided_pipeline_signature != pipeline_signature or st.session_state.guided_pipeline_results is None:
+                                logger.info("Executing guided pipeline for signature %s", pipeline_signature)
+                                pipeline_results = run_supervised_guided_pipeline(
+                                    df,
+                                    target_col,
+                                    active_task_type,
+                                    model_choice,
+                                    handle_imbalance,
+                                    enable_feature_selection,
+                                    enable_hyperparameter_tuning,
+                                    scaled_trials,
+                                    cv_folds,
+                                    test_size_float
+                                )
+                                st.session_state.guided_pipeline_results = pipeline_results
+                                st.session_state.guided_pipeline_signature = pipeline_signature
+                            else:
+                                logger.info("Reusing previous guided pipeline results for signature %s", pipeline_signature)
+                                pipeline_results = st.session_state.guided_pipeline_results
+
+                            model = pipeline_results['model']
+                            preprocessor = pipeline_results['preprocessor']
+                            report = pipeline_results['report']
+                            training_time = pipeline_results['training_time']
+                            step_times = pipeline_results['step_times']
+                            train_indices = pipeline_results['train_indices']
+                            test_indices = pipeline_results['test_indices']
+
                             status_text = st.empty()
-                            progress_bar = st.progress(0)
-                            status_text.text("Step 1/4: Retaining preprocessed data...")
-                            proc_res = get_processed_data(df, target_col, enable_feature_selection)
-                            X, y, _, indices, preprocessor = \
-                                proc_res['X'], proc_res['y'], proc_res['task_type'], proc_res['indices'], proc_res['preprocessor']
-                            progress_bar.progress(25)
-                            
-                            # Step 2: Train-test split
-                            status_text.text("Step 2/4: Splitting data...")
-                            stratify = y if active_task_type == 'classification' else None
-                            X_train, X_test, y_train, y_test, train_indices, test_indices = train_test_split(
-                                X, y, indices, 
-                                test_size=test_size_float, 
-                                random_state=42,
-                                stratify=stratify
-                            )
-                            progress_bar.progress(35)
-                            
-                            # Step 3: Model training
-                            status_text.text("Step 3/4: Training model with hyperparameter tuning...")
-                            automl_model = EnhancedAutoMLModel(
-                                task_type=active_task_type,
-                                model_choice=model_choice,
-                                handle_imbalance=handle_imbalance if active_task_type == 'classification' else False,
-                                enable_tuning=enable_hyperparameter_tuning
-                            )
-                            
-                            training_time = automl_model.fit_with_tuning(X_train, y_train, cv_folds=cv_folds)
-                            model = automl_model.get_model()
-                            progress_bar.progress(75)
-                            
-                            # Step 4: Evaluation
-                            status_text.text("Step 4/4: Evaluating model...")
-                            report = enhanced_generate_report(
-                                model, X_test, y_test, active_task_type,
-                                cv_scores=automl_model.cv_scores
-                            )
-                            progress_bar.progress(100)
+                            progress_bar = st.progress(100)
                             status_text.text("Pipeline completed successfully!")
                             
                             # Display results
-                            st.success(f"Enhanced pipeline completed in {training_time:.1f} seconds!")
+                            total_runtime = sum(step_times.values())
+                            st.success(f"Enhanced pipeline completed in {total_runtime:.1f} seconds!")
+                            st.caption(f"Actual model fit time: {training_time:.3f} seconds")
+                            with st.expander("Execution Timeline", expanded=False):
+                                timing_rows = []
+                                for step_name, duration in step_times.items():
+                                    timing_rows.append({
+                                        "Step": step_name,
+                                        "Time": f"{duration:.3f} s",
+                                        "Time (ms)": f"{duration * 1000:.1f} ms"
+                                    })
+                                timing_rows.append({
+                                    "Step": "Total",
+                                    "Time": f"{total_runtime:.3f} s",
+                                    "Time (ms)": f"{total_runtime * 1000:.1f} ms"
+                                })
+                                timing_df = pd.DataFrame(timing_rows)
+                                st.dataframe(timing_df, hide_index=True, use_container_width=True)
+                                st.caption(
+                                    f"Training depth: {training_depth}. Hyperparameter trials: {scaled_trials}. "
+                                    "Short steps are shown in milliseconds; larger datasets and deeper tuning will increase runtime." 
+                                )
                             
                             # Performance validation
                             st.header("Performance Validation Results")
@@ -2336,9 +2515,9 @@ def main():
             X, _, detected_task_type, indices, preprocessor = \
                 proc_res['X'], proc_res['y'], proc_res['task_type'], proc_res['indices'], proc_res['preprocessor']
             
-            st.markdown(f"""
-                <div style='background: rgba(56, 189, 248, 0.1); padding: 1rem; border-radius: 10px; border: 1px solid rgba(56, 189, 248, 0.2); margin-bottom: 1rem;'>
-                    <span style='color: #38bdf8; font-weight: 600;'>Data Ready:</span> Preprocessing complete and optimized.
+            st.markdown("""
+                <div class='info-banner'>
+                    <strong>Data Ready:</strong> Preprocessing complete and optimized.
                 </div>
             """, unsafe_allow_html=True)
             
@@ -2352,7 +2531,7 @@ def main():
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("Analyze Spatial Distribution", key="analyze_spatial"):
-                    st.session_state.clustering_insights = benchmarker.analyze_dataset_stats(X)
+                    st.session_state.clustering_insights = cached_analyze_dataset_stats('clustering', X)
                     if not st.session_state.clustering_insights:
                         st.session_state.clustering_insights = ["Standard spatial distribution detected. Density-based or Centroid-based clustering should perform well."]
             with col2:
@@ -2372,13 +2551,13 @@ def main():
                             st.write(f"**{suggestion['algorithm']}** - Estimated Silhouette: {suggestion.get('estimated_silhouette', 'N/A')}")
             
             # Model selection
-            clustering_models = ["K-Means", "DBSCAN", "Hierarchical", "Spectral", "Gaussian Mixture"]
+            clustering_models = ["K-Means", "DBSCAN", "Hierarchical", "Gaussian Mixture"]
             model_choice = st.selectbox("Select Clustering Algorithm", clustering_models, key="clustering_model")
             
             # Parameters based on algorithm
             col1, col2 = st.columns(2)
             with col1:
-                if model_choice == "K-Means" or model_choice == "Hierarchical" or model_choice == "Spectral" or model_choice == "Gaussian Mixture":
+                if model_choice in ["K-Means", "Hierarchical", "Gaussian Mixture"]:
                     n_clusters = st.slider("Number of clusters", 2, 20, 3, key="n_clusters")
                 else:
                     n_clusters = None
@@ -2424,8 +2603,6 @@ def main():
                                     metrics['silhouette_score'] = None
                         elif model_choice == "Hierarchical":
                             labels, metrics, model = perform_clustering(X, 'Hierarchical', n_clusters)
-                        elif model_choice == "Spectral":
-                            labels, metrics, model = perform_clustering(X, 'Spectral', n_clusters)
                         elif model_choice == "Gaussian Mixture":
                             labels, metrics, model = perform_clustering(X, 'Gaussian Mixture', n_clusters)
                         
@@ -2498,9 +2675,9 @@ def main():
             X, _, detected_task_type, indices, preprocessor = \
                 proc_res['X'], proc_res['y'], proc_res['task_type'], proc_res['indices'], proc_res['preprocessor']
             
-            st.markdown(f"""
-                <div style='background: rgba(56, 189, 248, 0.1); padding: 1rem; border-radius: 10px; border: 1px solid rgba(56, 189, 248, 0.2); margin-bottom: 1rem;'>
-                    <span style='color: #38bdf8; font-weight: 600;'>Data Ready:</span> Preprocessing complete for dimensionality reduction.
+            st.markdown("""
+                <div class='info-banner'>
+                    <strong>Data Ready:</strong> Preprocessing complete for dimensionality reduction.
                 </div>
             """, unsafe_allow_html=True)
             
@@ -2512,7 +2689,7 @@ def main():
             benchmarker = AutomatedAlgorithmBenchmarker('dimensionality_reduction')
             
             if st.button("Analyze Variance Structure", key="analyze_variance"):
-                st.session_state.dr_insights = benchmarker.analyze_dataset_stats(X)
+                st.session_state.dr_insights = cached_analyze_dataset_stats('dimensionality_reduction', X)
                 if not st.session_state.dr_insights:
                     st.session_state.dr_insights = ["Uniform variance structure detected. Linear reduction (PCA) is recommended as a baseline."]
                 
@@ -2564,7 +2741,7 @@ def main():
                         if model_choice == "PCA":
                             X_reduced, metrics, model = perform_dimensionality_reduction(X, 'PCA', n_components)
                         elif model_choice == "t-SNE":
-                            model = TSNE(n_components=n_components, random_state=42, perplexity=perplexity)
+                            model = TSNE(n_components=n_components, random_state=DEFAULT_RANDOM_STATE, perplexity=perplexity)
                             X_reduced = model.fit_transform(X)
                             metrics = {}
                         elif model_choice == "UMAP":
@@ -2656,9 +2833,9 @@ def main():
             X, _, detected_task_type, indices, preprocessor = \
                 proc_res['X'], proc_res['y'], proc_res['task_type'], proc_res['indices'], proc_res['preprocessor']
             
-            st.markdown(f"""
-                <div style='background: rgba(56, 189, 248, 0.1); padding: 1rem; border-radius: 10px; border: 1px solid rgba(56, 189, 248, 0.2); margin-bottom: 1rem;'>
-                    <span style='color: #38bdf8; font-weight: 600;'>Data Ready:</span> Preprocessing complete and optimized.
+            st.markdown("""
+                <div class='info-banner'>
+                    <strong>Data Ready:</strong> Preprocessing complete and optimized.
                 </div>
             """, unsafe_allow_html=True)
             
@@ -2670,7 +2847,7 @@ def main():
             benchmarker = AutomatedAlgorithmBenchmarker('anomaly_detection')
             
             if st.button("Analyze Outlier Potential", key="analyze_outliers"):
-                st.session_state.anomaly_insights = benchmarker.analyze_dataset_stats(X)
+                st.session_state.anomaly_insights = cached_analyze_dataset_stats('anomaly_detection', X)
                 if not st.session_state.anomaly_insights:
                     st.session_state.anomaly_insights = ["No extreme statistical anomalies detected at first glance. Proceeding with detailed algorithmic detection."]
                 
@@ -2688,7 +2865,7 @@ def main():
                             st.write(f"**{suggestion['algorithm']}** - Estimated Precision: {suggestion.get('estimated_precision', 'N/A')}")
             
             # Model selection
-            anomaly_models = ["Isolation Forest", "One-Class SVM", "Local Outlier Factor", "Elliptic Envelope"]
+            anomaly_models = ["Isolation Forest", "Local Outlier Factor"]
             model_choice = st.selectbox("Select Anomaly Detection Algorithm", anomaly_models, key="anomaly_model")
             
             # Parameters
@@ -2716,12 +2893,8 @@ def main():
                         
                         if model_choice == "Isolation Forest":
                             anomaly_labels, anomaly_count, model = perform_anomaly_detection(X, 'Isolation Forest', contamination)
-                        elif model_choice == "One-Class SVM":
-                            anomaly_labels, anomaly_count, model = perform_anomaly_detection(X, 'One-Class SVM', contamination)
                         elif model_choice == "Local Outlier Factor":
                             anomaly_labels, anomaly_count, model = perform_anomaly_detection(X, 'Local Outlier Factor', contamination)
-                        elif model_choice == "Elliptic Envelope":
-                            anomaly_labels, anomaly_count, model = perform_anomaly_detection(X, 'Elliptic Envelope', contamination)
                         
                         progress_bar.progress(60)
                         
